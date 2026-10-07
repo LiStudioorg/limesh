@@ -33,6 +33,11 @@ NAT、防火墙还是跨洲链路。单个二进制承载全部角色。
 	root.PersistentFlags().StringArrayVarP(&configPaths, "config", "c", nil,
 		"配置文件路径,可重复;支持 * 与 ** 通配符")
 
+	// -v 是全局概念(提升日志详细度),在根命令注册使所有子命令共享,
+	// 避免每个子命令各自声明导致 `version -v` 这类调用失败。
+	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false,
+		"输出详细日志")
+
 	root.AddCommand(newNodeCmd(&configPaths))
 	root.AddCommand(newVersionCmd())
 

@@ -37,7 +37,7 @@ SIGINT/SIGTERM 后优雅关闭。握手、路由与数据面在后续阶段加�
 
 	cmd.Flags().StringVar(&logLevel, "log.level", "", "日志级别(debug/info/warn/error)")
 	cmd.Flags().StringVar(&logFormat, "log.format", "", "日志格式(console/json)")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "输出详细日志")
+	// 注:-v/--verbose 定义在根命令上,由所有子命令共享。
 
 	return cmd
 }
@@ -51,9 +51,20 @@ func runNode(cmd *cobra.Command, configPaths []string) error {
 	}
 
 	// ---- 加载配置(四层优先级) ----
+	//
+	// 必须传入 cmd.Flags() 之外的全集:cmd.Flags() 只包含本子命令自己声明的
+	// flag,不含根命令的持久 flag(如 -c);而 config.Load 需要看到所有已解析
+	// 的 flag 才能构成最高优先级层。cmd.Root().Flags() 返回根命令的持久 flag
+	// 与本命令 flag 的并集,正是这里需要的。
+	//
+	// 注意:InheritedFlags 只含"父命令的持久 flag",不含本命令自己的 flag,
+	// 因此不能单独使用;两者合并才能覆盖全部分支。
+	flags := cmd.Flags()
+	flags.AddFlagSet(cmd.Root().PersistentFlags())
+
 	cfg, err := config.Load(config.Options{
 		Paths: configPaths,
-		Flags: cmd.Flags(),
+		Flags: flags,
 	})
 	if err != nil {
 		return err
