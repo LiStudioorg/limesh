@@ -351,6 +351,21 @@ func toMap(c *Config) map[string]any {
 		peers = append(peers, p)
 	}
 
+	rules := make([]any, 0, len(c.Security.ACL.Rules))
+	for _, r := range c.Security.ACL.Rules {
+		ports := make([]any, 0, len(r.Ports))
+		for _, p := range r.Ports {
+			ports = append(ports, p)
+		}
+		rules = append(rules, map[string]any{
+			"action": r.Action,
+			"from":   r.From,
+			"to":     r.To,
+			"ports":  ports,
+			"proto":  r.Proto,
+		})
+	}
+
 	return map[string]any{
 		"network": map[string]any{
 			"name":     c.Network.Name,
@@ -364,6 +379,23 @@ func toMap(c *Config) map[string]any {
 		"log": map[string]any{
 			"level":  c.Log.Level,
 			"format": c.Log.Format,
+		},
+		"security": map[string]any{
+			"e2ee": c.Security.E2EE,
+			"key_rotation": map[string]any{
+				// 以字符串形式给出,koanf 会解成 time.Duration;
+				// 若给整数会被当作纳秒,与 TOML 中的 "168h" 语义不一致。
+				"interval": c.Security.KeyRotation.Interval.String(),
+				"overlap":  c.Security.KeyRotation.Overlap.String(),
+			},
+			"acl": map[string]any{
+				"default": c.Security.ACL.Default,
+				"rules":   rules,
+			},
+			"audit": map[string]any{
+				"enabled": c.Security.Audit.Enabled,
+				"path":    c.Security.Audit.Path,
+			},
 		},
 	}
 }

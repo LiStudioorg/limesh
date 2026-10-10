@@ -35,7 +35,92 @@ const (
 	DefaultNetworkName = "mesh"
 	// EnvPrefix 是环境变量前缀。
 	EnvPrefix = "MESH_"
+
+	// DefaultKeyRotationInterval 是密钥轮换的默认周期。
+	DefaultKeyRotationInterval = 168 * time.Hour
+	// DefaultKeyRotationOverlap 是密钥轮换时新旧密钥的默认重叠窗口。
+	DefaultKeyRotationOverlap = 24 * time.Hour
+	// DefaultACLDefault 是 ACL 的默认动作。
+	DefaultACLDefault = "allow"
+	// DefaultAuditPath 是审计日志的默认路径。
+	DefaultAuditPath = "/var/lib/mesh/audit.log"
 )
+
+// [security] 段相关取值范围(docs/CONFIG.md 6.8)。
+const (
+	// MinKeyRotationInterval 是密钥轮换周期的下限。
+	MinKeyRotationInterval = time.Hour
+	// MaxKeyRotationInterval 是密钥轮换周期的上限。
+	MaxKeyRotationInterval = 8760 * time.Hour
+	// MaxKeyRotationOverlap 是密钥重叠窗口的上限(下限为 0)。
+	MaxKeyRotationOverlap = 720 * time.Hour
+)
+
+// ACL 动作取值。
+const (
+	// ACLAllow 表示允许匹配的流量。
+	ACLAllow = "allow"
+	// ACLDeny 表示拒绝匹配的流量。
+	ACLDeny = "deny"
+)
+
+// ACLRule 是一条访问控制规则。
+//
+// 规则按**顺序**匹配,首条命中即生效(docs/CONFIG.md 6.8)。由于数组在合并
+// 时采用追加语义,基础规则在前、追加规则在后,追加规则无法覆盖基础规则。
+type ACLRule struct {
+	// Action 是命中该规则时执行的动作:allow / deny。
+	Action string `koanf:"action"`
+	// From 是源地址或网段,如 10.126.126.0/24。
+	From string `koanf:"from"`
+	// To 是目的地址或网段。
+	To string `koanf:"to"`
+	// Ports 是允许/拒绝的端口列表;为空表示任意端口。
+	Ports []int `koanf:"ports"`
+	// Proto 是协议:tcp / udp / icmp / any;为空表示任意协议。
+	Proto string `koanf:"proto"`
+}
+
+// KeyRotationConfig 描述密钥轮换策略。
+type KeyRotationConfig struct {
+	// Interval 是密钥轮换周期,范围 [1h, 8760h]。
+	Interval time.Duration `koanf:"interval"`
+	// Overlap 是轮换时新旧密钥的重叠窗口,范围 [0, 720h]。
+	Overlap time.Duration `koanf:"overlap"`
+}
+
+// ACLConfig 描述访问控制策略。
+type ACLConfig struct {
+	// Default 是未命中任何规则时的默认动作:allow / deny。
+	Default string `koanf:"default"`
+	// Rules 是顺序匹配的规则列表。
+	Rules []ACLRule `koanf:"rules"`
+}
+
+// AuditConfig 描述审计日志配置。
+type AuditConfig struct {
+	// Enabled 表示是否启用审计日志。
+	Enabled bool `koanf:"enabled"`
+	// Path 是审计日志文件路径。
+	Path string `koanf:"path"`
+}
+
+// SecurityConfig 描述加密、访问控制与密钥轮换。
+//
+// 字段定义与取值见 docs/CONFIG.md 6.8,该文档是配置契约。
+type SecurityConfig struct {
+	// E2EE 表示是否启用端到端加密。关闭后中继可解密流量,仅用于调试。
+	E2EE bool `koanf:"e2ee"`
+	// KeyRotation 描述密钥轮换策略。
+	KeyRotation KeyRotationConfig `koanf:"key_rotation"`
+	// ACL 描述访问控制策略。
+	ACL ACLConfig `koanf:"acl"`
+	// Audit 描述审计日志配置。
+	Audit AuditConfig `koanf:"audit"`
+}
+
+// validACLActions 是合法的 ACL 动作取值。
+var validACLActions = []string{ACLAllow, ACLDeny}
 
 // 支持的日志级别与格式。
 var (
@@ -57,6 +142,8 @@ type Config struct {
 	Peers []string `koanf:"peers"`
 	// Log 是日志配置。
 	Log LogConfig `koanf:"log"`
+	// Security 是加密、访问控制与密钥轮换配置。
+	Security SecurityConfig `koanf:"security"`
 	// Path 记录配置来源文件,供排错与来源追踪使用,不参与序列化。
 	Path string `koanf:"-"`
 }
@@ -123,6 +210,21 @@ func Default() *Config {
 			Level:  DefaultLogLevel,
 			Format: DefaultLogFormat,
 		},
+		Security: SecurityConfig{
+			E2EE: true,
+			KeyRotation: KeyRotationConfig{
+				Interval: DefaultKeyRotationInterval,
+				Overlap:  DefaultKeyRotationOverlap,
+			},
+			ACL: ACLConfig{
+				Default: DefaultACLDefault,
+				Rules:   []ACLRule{},
+			},
+			Audit: AuditConfig{
+				Enabled: false,
+				Path:    DefaultAuditPath,
+			},
+		},
 	}
 }
 
@@ -173,6 +275,55 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: validate: log.format %q not in %v", c.Log.Format, validLogFormats)
 	}
 
+	if err := c.Security.validate(); err != nil {
+		return fmt.Errorf("config: validate: security: %w", err)
+	}
+
+	return nil
+}
+
+// validate 校验 [security] 段的取值范围(docs/CONFIG.md 6.8)。
+func (s SecurityConfig) validate() error {
+	if !contains(validACLActions, s.ACL.Default) {
+		return fmt.Errorf("acl.default %q not in %v", s.ACL.Default, validACLActions)
+	}
+
+	if s.KeyRotation.Interval < MinKeyRotationInterval || s.KeyRotation.Interval > MaxKeyRotationInterval {
+		return fmt.Errorf("key_rotation.interval %v out of range [%v, %v]",
+			s.KeyRotation.Interval, MinKeyRotationInterval, MaxKeyRotationInterval)
+	}
+	if s.KeyRotation.Overlap < 0 || s.KeyRotation.Overlap > MaxKeyRotationOverlap {
+		return fmt.Errorf("key_rotation.overlap %v out of range [0, %v]",
+			s.KeyRotation.Overlap, MaxKeyRotationOverlap)
+	}
+	// 重叠窗口不应超过轮换周期,否则新旧密钥永远无法结束共存。
+	if s.KeyRotation.Overlap > s.KeyRotation.Interval {
+		return fmt.Errorf("key_rotation.overlap %v must not exceed interval %v",
+			s.KeyRotation.Overlap, s.KeyRotation.Interval)
+	}
+
+	for i, r := range s.ACL.Rules {
+		if err := r.validate(); err != nil {
+			return fmt.Errorf("acl.rules[%d]: %w", i, err)
+		}
+	}
+
+	if s.Audit.Enabled && s.Audit.Path == "" {
+		return fmt.Errorf("audit.path must not be empty when audit is enabled")
+	}
+	return nil
+}
+
+// validate 校验单条 ACL 规则。
+func (r ACLRule) validate() error {
+	if !contains(validACLActions, r.Action) {
+		return fmt.Errorf("action %q not in %v", r.Action, validACLActions)
+	}
+	for _, p := range r.Ports {
+		if p < 0 || p > 65535 {
+			return fmt.Errorf("port %d out of range [0, 65535]", p)
+		}
+	}
 	return nil
 }
 
@@ -252,8 +403,14 @@ func (c *Config) Snapshot() *Config {
 	cp := *c
 	cp.Listen = append([]ListenConfig(nil), c.Listen...)
 	cp.Peers = append([]string(nil), c.Peers...)
+
+	// [security].acl.rules 是唯一的嵌套切片,必须深拷贝,否则快照与原件共享
+	// 底层数组,热重载时会出现"改了一份、两份都变"的隐性别名。
+	cp.Security.ACL.Rules = make([]ACLRule, len(c.Security.ACL.Rules))
+	for i, r := range c.Security.ACL.Rules {
+		rc := r
+		rc.Ports = append([]int(nil), r.Ports...)
+		cp.Security.ACL.Rules[i] = rc
+	}
 	return &cp
 }
-
-// 保留 time 导入:热重载与超时配置在后续阶段使用。
-var _ = time.Second
