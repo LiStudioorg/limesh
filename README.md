@@ -1202,6 +1202,21 @@ mesh_route_convergence_seconds 0.42
 
 ## 常见问题(FAQ)
 
+### 为什么 `mesh peer add` 后连接不上?
+
+当前版本(Phase 1a)需要**手工提供对端公钥**。Noise IK 握手要求发起方预先知道
+响应方的长期公钥,而自动获取公钥需要控制面下发或发现机制——这部分将在 Phase 2 支持。
+
+因此在 Phase 1a:
+
+- 用 `mesh peer add` 只填了地址是不够的,还需要对端公钥;
+- 对端公钥可用 `mesh status` 查看(或在 `PeerSpec{Addr, PublicKey}` 中显式注入);
+- 完整流程(控制面自动下发公钥)将在 Phase 2 支持。
+
+> 另:Phase 1a 尚未实现真实打洞与中继。若 `mesh peer list` 显示 `probing` 或
+> `relayed`,说明状态机在推进,但底层仍是状态占位,不代表已建立真实传输路径。
+> 详见 [AGENTS.md §8.9.3](</AGENTS.md>)。
+
 ### 打洞失败怎么办?
 
 **先确认这是不是问题。** 打洞失败会自动降级到中继,网络依然可用,只是延迟略高、占用中继带宽。

@@ -763,6 +763,8 @@ peer_dead_after      = "120s"
 - `routing.ewma_alpha` 越小越平滑。路径抖动会导致 TCP 流在两条路径间迁移进而乱序,平滑是必需而非优化。
 - `multipath_mode = "packet"` 会让同一 TCP 流乱序,**仅在承载纯 UDP 流量时**才建议开启;默认 `flow` 按五元组哈希分流,保留单流顺序性。
 - `peer_degraded_after` 与 `peer_dead_after` 必须与 `keepalive_interval` 协调:`degraded = 3 × keepalive`,`dead = 6 × keepalive`。
+- 这两个阈值对应 Peer 状态机的 `Degraded` 与 `Dead` 状态。Peer 状态名的完整
+  枚举与语义以 [AGENTS.md §8.9.1](</AGENTS.md>) 为准,本文件不另行定义别名。
 - `weighted` 策略下未在 `weight` 表中出现的节点使用默认权重。
 
 ### 6.8 security
