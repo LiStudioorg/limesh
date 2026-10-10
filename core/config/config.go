@@ -36,6 +36,11 @@ const (
 	// EnvPrefix 是环境变量前缀。
 	EnvPrefix = "MESH_"
 
+	// DefaultIngressMode 是默认接入模式:优先 TUN,失败自动降级。
+	DefaultIngressMode = "auto"
+	// DefaultIngressInterface 是默认 TUN 接口名。
+	DefaultIngressInterface = "mesh0"
+
 	// DefaultKeyRotationInterval 是密钥轮换的默认周期。
 	DefaultKeyRotationInterval = 168 * time.Hour
 	// DefaultKeyRotationOverlap 是密钥轮换时新旧密钥的默认重叠窗口。
@@ -144,6 +149,10 @@ type Config struct {
 	Log LogConfig `koanf:"log"`
 	// Security 是加密、访问控制与密钥轮换配置。
 	Security SecurityConfig `koanf:"security"`
+	// Ingress 是接入层配置。
+	Ingress IngressConfig `koanf:"ingress"`
+	// TUN 是 TUN 设备配置。
+	TUN TUNConfig `koanf:"tun"`
 	// Path 记录配置来源文件,供排错与来源追踪使用,不参与序列化。
 	Path string `koanf:"-"`
 }
@@ -183,6 +192,39 @@ func (l ListenConfig) HostPort() string {
 	}
 	return l.Addr
 }
+
+// IngressConfig 描述接入层配置(docs/CONFIG.md 6.4)。
+type IngressConfig struct {
+	// Mode 是接入模式:tun / no-tun / auto。
+	Mode string `koanf:"mode"`
+	// Interface 是 TUN 接口名;留空则使用系统默认或系统分配。
+	//
+	// macOS 的 utun 由系统分配名字,此字段必须留空。
+	Interface string `koanf:"interface"`
+}
+
+// TUNConfig 描述 TUN 设备配置。
+//
+// 与 IngressConfig.Interface 的关系:两者都能指定接口名,Name 优先。
+// 保留两个入口是为了兼容 docs/CONFIG.md 6.4 的 [ingress].interface 与
+// 更直观的 [tun].name 两种写法。
+type TUNConfig struct {
+	// Name 是 TUN 接口名;留空则回退到 ingress.interface,再回退到默认值。
+	Name string `koanf:"name"`
+}
+
+// 接入模式取值。
+const (
+	// IngressModeTUN 表示使用内核 TUN 设备(需要 CAP_NET_ADMIN / root)。
+	IngressModeTUN = "tun"
+	// IngressModeNoTUN 表示使用用户态协议栈(Phase 3 实现)。
+	IngressModeNoTUN = "no-tun"
+	// IngressModeAuto 表示优先 TUN,失败时按可用能力降级。
+	IngressModeAuto = "auto"
+)
+
+// validIngressModes 是合法的接入模式取值。
+var validIngressModes = []string{IngressModeTUN, IngressModeNoTUN, IngressModeAuto}
 
 // LogConfig 描述日志行为。
 type LogConfig struct {
@@ -225,6 +267,11 @@ func Default() *Config {
 				Path:    DefaultAuditPath,
 			},
 		},
+		Ingress: IngressConfig{
+			Mode:      DefaultIngressMode,
+			Interface: DefaultIngressInterface,
+		},
+		TUN: TUNConfig{},
 	}
 }
 
@@ -279,7 +326,28 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: validate: security: %w", err)
 	}
 
+	if !contains(validIngressModes, c.Ingress.Mode) {
+		return fmt.Errorf("config: validate: ingress.mode %q not in %v", c.Ingress.Mode, validIngressModes)
+	}
+
 	return nil
+}
+
+// EffectiveTUNName 返回最终使用的 TUN 接口名。
+//
+// 优先级:tun.name > ingress.interface > 默认值。留空表示由系统分配
+// (macOS 的 utun* 即属此类)。
+func (c *Config) EffectiveTUNName() string {
+	if c == nil {
+		return ""
+	}
+	if c.TUN.Name != "" {
+		return c.TUN.Name
+	}
+	if c.Ingress.Interface != "" {
+		return c.Ingress.Interface
+	}
+	return DefaultIngressInterface
 }
 
 // validate 校验 [security] 段的取值范围(docs/CONFIG.md 6.8)。

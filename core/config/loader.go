@@ -397,6 +397,13 @@ func toMap(c *Config) map[string]any {
 				"path":    c.Security.Audit.Path,
 			},
 		},
+		"ingress": map[string]any{
+			"mode":      c.Ingress.Mode,
+			"interface": c.Ingress.Interface,
+		},
+		"tun": map[string]any{
+			"name": c.TUN.Name,
+		},
 	}
 }
 

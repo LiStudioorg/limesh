@@ -14,6 +14,7 @@ require (
 	github.com/stretchr/testify v1.9.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.57.0
+	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
 )
 
 require (
@@ -25,6 +26,8 @@ require (
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

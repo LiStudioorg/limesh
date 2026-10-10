@@ -35,10 +35,11 @@ func newHandshakeNode(t *testing.T, name string, kp *crypto.KeyPair, recv chan [
 	require.NoError(t, cfg.Validate())
 
 	n, err := New(Options{
-		Config:  cfg,
-		Logger:  zap.NewNop(),
-		KeyPair: kp,
-		Peers:   peers,
+		Config:    cfg,
+		Logger:    zap.NewNop(),
+		KeyPair:   kp,
+		Peers:     peers,
+		NoIngress: true, // 本测试只验证加密数据面,不接 TUN
 		OnPlaintext: func(srcID [crypto.NodeIDSize]byte, plaintext []byte) {
 			// 复制明文:回调返回后底层缓冲即失效。
 			cp := make([]byte, len(plaintext))
@@ -242,7 +243,7 @@ func TestSendDataWithoutSessionFails(t *testing.T) {
 	cfg.Peers = []string{}
 	require.NoError(t, cfg.Validate())
 
-	n, err := New(Options{Config: cfg, Logger: zap.NewNop(), KeyPair: key})
+	n, err := New(Options{Config: cfg, Logger: zap.NewNop(), KeyPair: key, NoIngress: true})
 	require.NoError(t, err)
 
 	other, err := crypto.GenerateKeyPair()

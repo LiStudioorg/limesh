@@ -1051,6 +1051,27 @@ no-tun 模式:
 
 降级提示必须包含:失败原因、降级后的能力边界、如何启用完整模式。静默降级是禁止的——用户必须知道自己处在哪个模式。
 
+### 12.3 Phase 1b 实现现状与临时限制
+
+截至 Phase 1b,`core/device` 与 `core/ingress` 已实现 TUN 模式:
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| `tun` 模式 | ✅ 已实现 | `core/device` 跨平台打开 TUN;`core/ingress` 做 IP 包搬运 |
+| TUN → 数据面 | ✅ 已实现 | TUN 读到的 IP 包经 `Outbound()` 交给 node 数据面加密发出 |
+| 数据面 → TUN | ✅ 已实现 | 解密后的 IP 包经 `Ingress.Deliver()` 写回 TUN |
+| 权限错误提示 | ✅ 已实现 | 权限不足时给出按平台(含 setcap/Docker/K8s)的修复指引 |
+| `no-tun` 模式 | ❌ 未实现 | 返回 `ErrNotImplemented`,Phase 3 落地 |
+| `auto` 降级 | ⚠️ 部分 | 权限不足时打印明确的降级提示,但 no-tun 未实现,故仍返回错误而非真正降级 |
+| 路由 | ⚠️ 两点直连 | 出站包一律发给唯一活跃对端(`DirectPeer`);多对端时报歧义错误。完整 OSPF 属 Phase 1c |
+
+**平台差异**:Linux 用 `mesh0`、macOS 用系统分配的 `utun*`、Windows 用 Wintun 的
+`mesh`、FreeBSD/OpenBSD 用 `tun*`。设备名解析优先级:`tun.name` > `ingress.interface`
+> 默认 `mesh0`(见 `Config.EffectiveTUNName`)。
+
+**验收边界**:两个(且仅两个)节点各自创建 TUN、完成 Noise 握手后,能通过虚拟
+IP 互 ping。此边界之外(多节点、打洞、中继)均属后续阶段。
+
 ---
 
 ## 13. 权限模型

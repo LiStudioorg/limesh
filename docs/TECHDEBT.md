@@ -132,12 +132,36 @@ Phase 2 实现 STUN/ICE 打洞与中继转发后,这两个状态才代表真实�
 
 ---
 
-## 5. 数据面明文回调 `OnPlaintext` 是临时接口
+## 5. 数据面明文回调 `OnPlaintext` 与 Ingress 并存
 
 **现状**
 
-`core/node` 数据面解密成功后,通过 `OnPlaintext` 回调交付明文;Phase 1a 默认丢弃。
+Phase 1b 起,`core/node` 在装配了 Ingress 时会用 Ingress 接管明文投递
+(`Deliver`),`OnPlaintext` 仅在**未装配 Ingress** 时使用(测试与纯数据面场景)。
+两条路径并存,由 `Options.Ingress` / `Options.NoIngress` 决定。
 
 **建议方向**
 
-Phase 3 接入 TUN / gVisor netstack 后,由 Ingress 取代该回调。
+Phase 3 的 no-tun 模式接入后,`OnPlaintext` 可彻底移除,统一为 Ingress。
+在此之前保留它是因为 Phase 1a 的加密数据面 E2E 测试依赖它,且它与 Ingress
+互斥,不会同时生效。
+
+---
+
+## 6. Phase 1b 两点直连路由是临时实现
+
+**现状**
+
+`datapath.DirectPeer` 要求恰好存在一个活跃会话:0 个则丢弃出站包,
+多于 1 个则报"路由歧义"错误。这是 Phase 1b"两点直连"的约定。
+
+**影响**
+
+三个及以上节点时,出站 IP 包无法判断下一跳,`DirectPeer` 返回错误、
+包被丢弃。多节点组网不可用。
+
+**建议方向**
+
+Phase 1c 实现 OSPF(链路状态泛洪 + Dijkstra)与路由表后,出站包按目的
+虚拟 IP 查表选下一跳,`DirectPeer` 退化为"唯一直接邻居"的便捷访问器或移除。
+详见 AGENTS.md §12.3。

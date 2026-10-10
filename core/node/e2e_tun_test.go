@@ -1,0 +1,132 @@
+//go:build linux && root
+
+package node
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/LiStudioorg/limesh/core/config"
+	"github.com/LiStudioorg/limesh/core/crypto"
+)
+
+// 本文件仅在 `go test -tags root` 且以 root 运行时编译与执行。
+//
+// 它用**真实 TUN 设备**验证 Phase 1b 的验收目标:两个节点通过虚拟网 IP 互 ping。
+//
+// 运行方式:
+//
+//	sudo -E env PATH=$PATH LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
+//	    go test -race -tags root -run TestTunPing ./core/node/ -v
+//
+// 无 root 时本文件不参与编译(root tag 未开启),因此 CI 不受影响。
+
+// tunPingConfig 生成一个使用指定 TUN 名与虚拟 IP 的节点配置。
+func tunPingConfig(t *testing.T, name, hostname, tunName string) *config.Config {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Network.Name = "tun-ping-e2e"
+	cfg.Network.Hostname = hostname
+	cfg.Listen = []config.ListenConfig{{Addr: "udp://127.0.0.1:0"}}
+	cfg.Peers = []string{}
+	cfg.Ingress.Mode = "tun"
+	cfg.Ingress.Interface = tunName
+	require.NoError(t, cfg.Validate())
+	return cfg
+}
+
+// requireRoot 在非 root 环境下跳过测试。
+func requireRoot(t *testing.T) {
+	t.Helper()
+	if out, err := exec.Command("id", "-u").Output(); err != nil || strings.TrimSpace(string(out)) != "0" {
+		t.Skip("需要 root 权限运行 TUN 测试")
+	}
+}
+
+// ipCmd 执行一条 ip 命令,失败时返回错误。
+func ipCmd(args ...string) error {
+	out, err := exec.Command("ip", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip %s: %w: %s", strings.Join(args, " "), err, out)
+	}
+	return nil
+}
+
+// TestTunPing 用真实 TUN 设备验证两个节点能通过虚拟 IP 互 ping。
+func TestTunPing(t *testing.T) {
+	requireRoot(t)
+
+	if _, err := exec.LookPath("ip"); err != nil {
+		t.Skip("缺少 ip 命令(iproute2),跳过")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	keyA, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+	keyB, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+
+	// 用固定虚拟 IP 便于 ping。openTUN 的内部地址由 NodeID 派生,
+	// 但 Phase 1b 我们手工配置虚拟 IP 以便 ping 具体地址。
+	vipA := "10.126.126.1"
+	vipB := "10.126.126.2"
+	tunA := "meshping0"
+	tunB := "meshping1"
+
+	// ---- 节点 B:先启动(被动响应) ----
+	cfgB := tunPingConfig(t, "b", "node-b", tunB)
+	nodeB, err := New(Options{Config: cfgB, Logger: zap.NewNop(), KeyPair: keyB})
+	require.NoError(t, err)
+	defer nodeB.Close()
+
+	require.NoError(t, nodeB.RuntimeStart(ctx))
+	require.Eventually(t, func() bool { return len(nodeB.Addrs()) == 1 },
+		5*time.Second, 10*time.Millisecond, "B 应开始监听")
+	addrB := nodeB.Addrs()[0]
+
+	// ---- 节点 A:主动向 B 握手 ----
+	cfgA := tunPingConfig(t, "a", "node-a", tunA)
+	nodeA, err := New(Options{
+		Config: cfgA, Logger: zap.NewNop(), KeyPair: keyA,
+		Peers: []PeerSpec{{Addr: addrB, PublicKey: keyB.PublicKey}},
+	})
+	require.NoError(t, err)
+	defer nodeA.Close()
+	require.NoError(t, nodeA.RuntimeStart(ctx))
+
+	// 给 TUN 设备配置虚拟 IP 并启用。
+	namer, ok := nodeA.Ingress().(interface{ DeviceName() string })
+	require.True(t, ok, "TUN ingress 应暴露 DeviceName")
+	nameA := namer.DeviceName()
+	nameB := nodeB.Ingress().(interface{ DeviceName() string }).DeviceName()
+	t.Cleanup(func() {
+		_ = ipCmd("link", "del", nameA)
+		_ = ipCmd("link", "del", nameB)
+	})
+
+	require.NoError(t, ipCmd("addr", "add", vipA+"/24", "dev", nameA))
+	require.NoError(t, ipCmd("link", "set", nameA, "up"))
+	require.NoError(t, ipCmd("addr", "add", vipB+"/24", "dev", nameB))
+	require.NoError(t, ipCmd("link", "set", nameB, "up"))
+
+	// 等握手完成。
+	require.Eventually(t, func() bool {
+		return nodeA.Peers().Len() > 0 && nodeB.Peers().Len() > 0
+	}, 10*time.Second, 50*time.Millisecond, "双方应完成握手")
+
+	// ---- ping ----
+	out, err := exec.Command("ping", "-c", "3", "-W", "3", vipB).CombinedOutput()
+	t.Logf("ping 输出:\n%s", out)
+	require.NoError(t, err, "ping 应成功")
+	assert.Contains(t, string(out), "0% packet loss", "应无丢包")
+}

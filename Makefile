@@ -50,7 +50,7 @@ ALL_PLATFORMS := \
 	illumos/amd64 \
 	aix/ppc64
 
-.PHONY: all build build-main build-all run test test-race clean fmt vet tidy help
+.PHONY: all build build-main build-all run test test-race test-tun test-all clean fmt vet tidy help
 
 all: build
 
@@ -96,6 +96,18 @@ test:
 ## test-race: 带竞态检测运行测试
 test-race:
 	$(GO) test -race ./...
+
+## test-tun: 以 root 运行真实 TUN 端到端测试(需要 sudo)
+test-tun:
+	@if [ "$$(id -u)" = "0" ]; then \
+		$(GO) test -tags root -run TestTun ./core/node/ -v; \
+	else \
+		sudo -E env PATH=$$PATH LD_LIBRARY_PATH=$$LD_LIBRARY_PATH \
+			$(GO) test -tags root -run TestTun ./core/node/ -v; \
+	fi
+
+## test-all: 运行单元测试与 TUN 测试
+test-all: test test-tun
 
 ## fmt: 格式化
 fmt:

@@ -116,6 +116,43 @@ func newDatapath(local *crypto.KeyPair, cv *configView, log *zap.Logger) *datapa
 // LocalNodeID 返回本节点身份。
 func (d *datapath) LocalNodeID() [crypto.NodeIDSize]byte { return d.localID }
 
+// DirectPeer 返回 Phase 1b 两点直连场景下的唯一活跃对端。
+//
+// Phase 1b 不做 OSPF 路由:所有来自 TUN 的流量都发给"唯一已建立会话的对端"。
+// 因此这里要求恰好存在一个可用会话;0 个时返回错误(无处可发),多于 1 个时
+// 返回错误(无法判断走哪条——真正的多节点路由属 Phase 1c)。
+//
+// 返回值语义:(peerID, ok, err):
+//   - ok=true  :找到唯一对端,peerID 有效;
+//   - ok=false :当前无可用会话(调用方应丢弃包或等待握手完成),err 为 nil;
+//   - err!=nil :存在歧义(多个对端),无法在 Phase 1b 决策。
+func (d *datapath) DirectPeer() (peerID [crypto.NodeIDSize]byte, ok bool, err error) {
+	ids := d.sessions.IDs()
+
+	var found [crypto.NodeIDSize]byte
+	count := 0
+	for _, id := range ids {
+		s, ok := d.sessions.Get(id)
+		if !ok || s.Closed() {
+			continue
+		}
+		if count == 0 {
+			found = s.PeerID
+		}
+		count++
+	}
+
+	switch count {
+	case 0:
+		return [crypto.NodeIDSize]byte{}, false, nil
+	case 1:
+		return found, true, nil
+	default:
+		return [crypto.NodeIDSize]byte{}, false,
+			fmt.Errorf("node: direct peer ambiguous: %d sessions (routing is Phase 1c)", count)
+	}
+}
+
 // Sessions 返回会话池,供上层观测。
 func (d *datapath) Sessions() *session.Manager { return d.sessions }
 

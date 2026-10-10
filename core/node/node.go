@@ -16,10 +16,23 @@ import (
 
 	"github.com/LiStudioorg/limesh/core/config"
 	"github.com/LiStudioorg/limesh/core/crypto"
+	"github.com/LiStudioorg/limesh/core/ingress"
+	"github.com/LiStudioorg/limesh/core/packet"
 	"github.com/LiStudioorg/limesh/core/peer"
 	"github.com/LiStudioorg/limesh/core/session"
 	"github.com/LiStudioorg/limesh/core/transport"
 )
+
+// packetFromPlaintext 把一段 IP 明文包装成 Ingress 可消费的 ZCPacket。
+//
+// Deliver 约定其入参的 Payload() 是 IP 包,故此处的 ZCPacket 仅作为载体;
+// 它不携带真实会话头(接入层不感知会话)。packet.New 会拷贝载荷,因此
+// 调用方传入的切片在返回后即可释放。
+func packetFromPlaintext(plaintext []byte) *packet.ZCPacket {
+	pkt := packet.New(plaintext)
+	pkt.SetType(packet.TypeData)
+	return pkt
+}
 
 // 节点错误。
 var (
@@ -27,6 +40,8 @@ var (
 	ErrAlreadyRunning = errors.New("node: already running")
 	// ErrNoListener 表示没有任何监听器成功启动。
 	ErrNoListener = errors.New("node: no listener started")
+	// ErrNoIngress 表示节点未装配接入层,无法转发 IP 包。
+	ErrNoIngress = errors.New("node: no ingress configured")
 )
 
 // Node 是一个最小可用的 Limesh 节点。
@@ -54,6 +69,8 @@ type Node struct {
 	keyPair *crypto.KeyPair
 	// peerSpecs 是待连接的已知对端(地址 + 公钥)。
 	peerSpecs []PeerSpec
+	// ingress 是接入层(TUN)。为空时节点只做加密数据面,不接入 IP 包。
+	ingress ingress.Ingress
 }
 
 // Options 是构造 Node 的参数。
@@ -74,9 +91,17 @@ type Options struct {
 	Peers []PeerSpec
 	// OnPlaintext 是数据包解密成功后的回调。为空时明文被丢弃。
 	//
-	// Phase 1a 用它把明文交付给测试或临时消费者;Ingress 接入后由 Ingress
-	// 取代这一回调。回调在数据面读循环内同步调用,实现必须尽快返回。
+	// 当装配了 Ingress 时,Ingress 优先接管明文投递,本回调不再被调用
+	// (避免同一明文被两个消费者重复处理)。
+	//
+	// 回调在数据面读循环内同步调用,实现必须尽快返回。
 	OnPlaintext func(srcID [crypto.NodeIDSize]byte, plaintext []byte)
+	// Ingress 允许注入接入层实现(测试用途)。
+	// 为空且配置了密钥时,按配置自动构造接入层。
+	Ingress ingress.Ingress
+	// NoIngress 为真时跳过接入层构造,仅运行加密数据面(Phase 1a 行为)。
+	// 用于只需要握手/加密、不需要 IP 转发的场景(如现有 E2E 测试)。
+	NoIngress bool
 }
 
 // New 按配置装配一个节点。
@@ -103,6 +128,20 @@ func New(opts Options) (*Node, error) {
 		peerSpecs: append([]PeerSpec(nil), opts.Peers...),
 	}
 
+	// 接入层:优先使用注入的实现;否则按配置构造(可用 NoIngress 跳过)。
+	if opts.Ingress != nil {
+		node.ingress = opts.Ingress
+	} else if opts.KeyPair != nil && !opts.NoIngress {
+		ing, err := ingress.New(ingress.Options{
+			Config: opts.Config,
+			Logger: log,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("node: new: ingress: %w", err)
+		}
+		node.ingress = ing
+	}
+
 	if opts.KeyPair != nil {
 		cv := &configView{
 			networkName: opts.Config.Network.Name,
@@ -110,7 +149,15 @@ func New(opts Options) (*Node, error) {
 			e2ee:        opts.Config.Security.E2EE,
 		}
 		node.dp = newDatapath(opts.KeyPair, cv, log)
-		if opts.OnPlaintext != nil {
+
+		// 明文投递:装配了 Ingress 时交给 Ingress 写回 TUN;否则用注入的回调。
+		switch {
+		case node.ingress != nil:
+			ing := node.ingress
+			node.dp.setPlaintextHandler(func(_ [crypto.NodeIDSize]byte, plaintext []byte) {
+				ing.Deliver(packetFromPlaintext(plaintext))
+			})
+		case opts.OnPlaintext != nil:
 			node.dp.setPlaintextHandler(opts.OnPlaintext)
 		}
 	}
@@ -134,6 +181,9 @@ func (n *Node) Config() *config.Config { return n.cfg }
 
 // Transport 返回节点使用的传输实例。
 func (n *Node) Transport() transport.Transport { return n.transport }
+
+// Ingress 返回节点装配的接入层;未装配时返回 nil。
+func (n *Node) Ingress() ingress.Ingress { return n.ingress }
 
 // Listeners 返回已启动的监听器。Run 之前为空。
 func (n *Node) Listeners() []transport.Listener {
@@ -202,12 +252,21 @@ func (n *Node) Run(ctx context.Context) error {
 	// 若已配置长期密钥,则启动加密数据面。
 	dpDone := n.startDatapath(ctx, started)
 
+	// 接入层 → 数据面的转发循环:把 TUN 上读到的 IP 包加密后发给对端。
+	fwdDone := n.startIngressForwarding(ctx)
+
+	ingressMode := ""
+	if n.ingress != nil {
+		ingressMode = string(n.ingress.Mode())
+	}
+
 	n.log.Info("mesh node running",
 		zap.String("name", n.cfg.Network.Name),
 		zap.String("hostname", n.Hostname),
 		zap.Int("listeners", len(started)),
 		zap.Strings("peers", n.cfg.Peers),
 		zap.Bool("encrypted", n.dp != nil),
+		zap.String("ingress", ingressMode),
 	)
 
 	// 阻塞至上下文取消。
@@ -222,7 +281,10 @@ func (n *Node) Run(ctx context.Context) error {
 		zap.String("reason", context.Cause(ctx).Error()),
 	)
 
-	// 先停数据面再关监听器:数据面读循环依赖监听 socket 存活。
+	// 先停转发循环(它读 ingress.Outbound),再停数据面,最后关监听器。
+	if fwdDone != nil {
+		<-fwdDone
+	}
 	if dpDone != nil {
 		<-dpDone
 	}
@@ -231,6 +293,63 @@ func (n *Node) Run(ctx context.Context) error {
 		return fmt.Errorf("node: run: shutdown: %w", err)
 	}
 	return nil
+}
+
+// startIngressForwarding 启动"TUN → 数据面"的转发循环。
+//
+// 返回循环结束信号;未装配接入层或数据面时返回 nil。
+//
+// Phase 1b 采用最简路由:出站包一律发给唯一的活跃对端(DirectPeer)。
+// 完整 OSPF 路由属 Phase 1c。
+func (n *Node) startIngressForwarding(ctx context.Context) <-chan struct{} {
+	if n.ingress == nil || n.dp == nil {
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.forwardIngressToDataPath(ctx)
+	}()
+	return done
+}
+
+// forwardIngressToDataPath 从接入层读取本机产生的 IP 包,加密后发给对端。
+//
+// 反方向(数据面 → 接入层)由数据面的明文回调驱动,见 New 中的装配。
+func (n *Node) forwardIngressToDataPath(ctx context.Context) {
+	out := n.ingress.Outbound()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case pkt, ok := <-out:
+			if !ok {
+				// 接入层已关闭(读循环退出)。
+				return
+			}
+			n.forwardOne(pkt)
+		}
+	}
+}
+
+// forwardOne 处理一个来自 TUN 的 IP 包:查对端 → 加密 → 发送。
+func (n *Node) forwardOne(pkt *packet.ZCPacket) {
+	peerID, ok, err := n.dp.DirectPeer()
+	if err != nil {
+		n.log.Debug("ingress forward: no route", zap.Error(err))
+		return
+	}
+	if !ok {
+		// 尚无已建立会话的对端:握手未完成,丢弃。
+		n.log.Debug("ingress forward: no peer session yet, dropping packet")
+		return
+	}
+
+	if err := n.dp.SendData(peerID, pkt.Payload()); err != nil {
+		n.log.Debug("ingress forward: send failed",
+			zap.String("peer", crypto.NodeIDString(peerID)), zap.Error(err))
+	}
 }
 
 // startDatapath 把支持数据报的监听器接入数据面并启动它,返回其结束信号。
@@ -390,7 +509,15 @@ func (n *Node) Close() error {
 	listeners := n.listeners
 	n.listeners = nil
 	dp := n.dp
+	ing := n.ingress
 	n.mu.Unlock()
+
+	// 先关接入层:其读循环会结束并关闭 Outbound,使转发循环退出。
+	if ing != nil {
+		if err := ing.Close(); err != nil {
+			n.log.Warn("ingress close failed", zap.Error(err))
+		}
+	}
 
 	// 数据面可能在 Run 之外被直接关闭(例如构造后未 Run 即 Close),
 	// 这里做幂等兜底。
