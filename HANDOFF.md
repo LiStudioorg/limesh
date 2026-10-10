@@ -1,0 +1,949 @@
+# Limesh 交接文档
+
+> 面向接手 Limesh 开发的下一个 AI/工程师。
+> 本文档描述**截至 2026-10-10 的真实仓库状态**,包括已完成的部分、未完成的部分、
+> 以及所有踩过的坑。请先读完本文再动手。
+>
+> 配套文档:[AGENTS.md](</AGENTS.md>)(技术方案)、[docs/CONFIG.md](</docs/CONFIG.md>)(配置系统)、
+> [docs/TRANSPORT.md](</docs/TRANSPORT.md>)(传输协议)、[README.md](</README.md>)(用户文档)。
+
+---
+
+## 0. 30 秒速览
+
+| 项 | 状态 |
+|---|---|
+| 当前阶段 | Phase 1a(Noise 握手 + Session + Replay),**完成约 60%** |
+| 已完成 | `core/packet`、`core/config`、`core/transport`(仅 UDP)、`core/crypto`、`core/session`、`core/handshake`、`cmd/mesh` 骨架 |
+| 未完成 | `core/peer`(状态机)、`core/node` 数据面集成、`core/config` 的 `[security]` 段、E2E 测试 |
+| 测试 | 8 个包全部通过,覆盖率 75.4% ~ 99.3%(见 §3) |
+| 已知环境限制 | `gcc` 缺失 → `go test -race` **无法运行**;`make` 未安装 |
+| 最近提交 | `d121c41 feat(handshake): implement Noise IK 1-RTT handshake` |
+
+**下一步最重要的一件事**:实现 `core/peer` 状态机(§5.1)。这是当前唯一的架构空洞。
+
+---
+
+## 1. 工作环境与构建
+
+### 1.1 必备环境变量
+
+**每个 bash 调用都要先 export**,否则 go 会尝试写 `$HOME` 而失败(容器内 `$HOME` 不可写):
+
+```bash
+export GOCACHE=/home/li63050a/work/limesh/.gocache
+export GOMODCACHE=/home/li63050a/work/limesh/.gomodcache
+export GOPATH=/home/li63050a/work/limesh/.gopath
+export GOFLAGS=-mod=mod
+```
+
+这三个目录在 `.gitignore` 内,不会污染仓库。
+
+### 1.2 常用命令
+
+```bash
+go build ./...
+go test ./... -cover
+go vet ./...
+gofmt -l .                    # 应输出为空
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
+```
+
+### 1.3 环境限制(重要)
+
+| 限制 | 影响 | 应对 |
+|---|---|---|
+| **无 `gcc`**,且无 root 无法安装 | `go test -race` 报 `-race requires cgo`;`CGO_ENABLED=1` 后报 `cgo: C compiler "gcc" not found` | 用重量级并发测试替代(见 §7.2)。**接手的机器若能装 gcc,第一件事就是跑 `-race`** |
+| **无 `make`** | `Makefile` 完全未经验证 | 直接调用 `go build` / `go test`;不要相信 Makefile 能跑 |
+| 无 root | 不能 `apt-get` | 见上 |
+
+### 1.4 工具链
+
+- Go **1.27.1** linux/amd64(注意:`go.mod` 声明 `go 1.26.0`,这是 `go get` 自动提上去的)
+- 模块路径 `github.com/LiStudioorg/limesh`
+- 仓库 `https://github.com/LiStudioorg/limesh`,分支 `main`
+
+### 1.5 Git 约定
+
+- 提交身份**必须**是 `li63050a <li63050@foxmail.com>`(已配置)。
+- 只允许在 `main` 分支工作,**禁止**新建分支、改名、force push、改写远端历史。
+- 提交前 `git pull --rebase origin main`;有冲突就停下报告,不要自作主张解决。
+- **每个提交必须能独立编译**(`go build ./...` 通过)。
+
+推送时不要把 token 写进 `.git/config`:
+
+```bash
+git -c "url.https://x-access-token:${TOKEN}@github.com/.insteadOf=https://github.com/" push origin main
+```
+
+---
+
+## 2. 目录布局的现实(与 AGENTS.md 不一致,以现实为准)
+
+**这是最容易让新人困惑的一点。** AGENTS.md §6 画的目录树用 `internal/`,但实际代码全部在**顶层 `core/`**:
+
+| AGENTS.md 写的 | 实际路径 | 说明 |
+|---|---|---|
+| `internal/packet/` | `core/packet/` | ✅ 已实现 |
+| `internal/config/` | `core/config/` | ✅ 已实现 |
+| `internal/transport/` | `core/transport/` | ✅ 已实现(仅 UDP) |
+| `internal/crypto/` | `core/crypto/` | ✅ 已实现 |
+| — | `core/session/` | ✅ 已实现(AGENTS.md 未单列) |
+| — | `core/handshake/` | ✅ 已实现(AGENTS.md 归在 crypto 下) |
+| `internal/peer/` | `core/peer/` | ❌ **待实现** |
+| `internal/cli/` | `cmd/mesh/` | ✅ 骨架已实现 |
+| `internal/role/node/` | `core/node/` | ✅ 已实现 |
+
+**请继续使用顶层 `core/` 布局**,不要"纠正"回 `internal/`——那会造成大规模无意义的重命名。
+
+### 2.1 当前真实文件清单
+
+```
+limesh/
+├── cmd/mesh/            266 行实现 / 262 行测试   (main, cmd_root, cmd_node, cmd_version)
+├── core/
+│   ├── packet/          367 / 297    ZCPacket 编解码
+│   ├── config/          880 / 694    四层配置合并
+│   ├── transport/       628 / 366    Transport 接口 + UDP
+│   ├── crypto/          443 / 698    密钥对 + NodeID + 虚拟 IP 派生
+│   ├── session/         931 / 1328   AEAD 会话 + 重放窗口 + 会话池
+│   ├── handshake/      1015 / 899    Noise IK 握手
+│   └── node/            246 / 686    Node 生命周期 + E2E
+├── docs/                CONFIG.md, TRANSPORT.md
+├── AGENTS.md            1331 行技术方案
+├── README.md            1510 行用户文档
+├── config.example.toml  70 行
+├── Makefile             119 行(未验证)
+└── go.mod / go.sum
+```
+
+---
+
+## 3. 已完成模块详解
+
+### 3.1 `core/packet` — ZCPacket(覆盖率 96.6%)
+
+固定 **48 字节**头,网络字节序:
+
+```
+Magic(1) Ver(1) Type(1) Flags(1) SessionID(4) Sequence(4) Ack(4)
+SrcNodeID(16) DstNodeID(16)  = 48 字节
+```
+
+关键 API:
+
+| 函数 | 语义 |
+|---|---|
+| `New(payload)` | 构造包,**总是拷贝** payload |
+| `NewWithHeadroom(buf, payloadLen)` | 零拷贝入口,调用方提供缓冲 |
+| `NewFromPool(n)` + `Release()` | 池化,高频路径用 |
+| `Unmarshal(data)` | 零拷贝解析,`data` 必须保持存活 |
+| `SetSrcNodeID(v []byte) error` | **返回 error**(长度校验),不是 `SetSrcNodeID(v)` |
+| `SrcNodeID() []byte` | 返回切片,**不是数组** |
+
+常量:`Magic=0x4C`、`ProtoVersion=1`、`HeaderSize=48`、`NodeIDSize=16`、`DefaultMTU=1380`、`DefaultPort=11010`。
+
+9 种包类型:`TypeHandshake=1`、`TypeHandshakeResp=2`、`TypeData=3`、`TypeKeepalive=4`、`TypeLSA=5`、`TypePunch=6`、`TypeRelay=7`、`TypeProbe=8`、`TypeClose=9`。
+
+5 个标志位:`FlagEncrypted=1<<0`、`FlagRelayed=1<<1`、`FlagProbe=1<<2`、`FlagFragStart=1<<3`、`FlagFragEnd=1<<4`。
+
+> ⚠️ **注意 `SetSrcNodeID` 返回 error**。这是长度校验,不要忽略它。
+
+### 3.2 `core/config` — 四层配置(覆盖率 89.3%)
+
+合并优先级(后者覆盖前者):
+
+```
+默认值 < 文件字段(TOML) < 内嵌 [cli] 块 < 环境变量(MESH_*) < 命令行(CLI)
+```
+
+合并规则:map 递归合并 / 数组**追加**(不去重)/ 标量覆盖。
+
+**`reset` 是合并期元字段**(与 `include` 并列),用于清空低优先级来源继承的值;裸写 `[]` **不会**清空。`reset` 只作用于低优先级来源,不能越过 ENV/CLI。
+
+主要 API:
+
+```go
+type Config struct {
+    Network NetworkConfig
+    Listen  []ListenConfig
+    Peers   []string
+    Log     LogConfig
+    Path    string
+    // ❌ 尚无 Security 字段 —— 见 §5.2
+}
+
+Load(Options{Paths, Flags, EnvPrefix, NoDefault}) (*Config, error)
+Default() *Config
+(c *Config) Validate() error
+(c *Config) Snapshot() *Config
+```
+
+| 常量 | 值 |
+|---|---|
+| `CLISection` | `"cli"` |
+| `IncludeKey` | `"include"` |
+| `ResetKey` | `"reset"` |
+
+> ⚠️ **TOML 表作用域陷阱**:`peers` 若写在 `[network]` 之下会被解析成 `network.peers`。
+> `peers` 必须写在**文件顶层**。
+
+> ⚠️ `[cli] log = "debug"` 会被规范化成 `log.level`(见 `normalizeCLIBlock`)。
+
+### 3.3 `core/transport` — 传输抽象(覆盖率 85.2%)
+
+```go
+type Transport interface {
+    Dial(ctx context.Context, addr string) (Conn, error)
+    Listen(addr string) (Listener, error)
+    Type() TransportType
+    Capabilities() Caps
+}
+
+type Conn interface {
+    Read([]byte) (int, error)
+    Write([]byte) (int, error)
+    Close() error
+    LocalAddr() net.Addr
+    RemoteAddr() net.Addr
+    SetReadDeadline(t time.Time) error   // ← 见下方说明
+    Stats() ConnStats
+}
+```
+
+> ⚠️ `SetReadDeadline` 是**在 Phase 0 后期补进接口的**。原本没有它,UDP `Read` 会永久阻塞,
+> 导致无法实现任何超时逻辑。新增传输实现时必须提供它。
+
+> ⚠️ UDP 的 `Accept` **复用监听 socket** 并做源地址过滤,同时把首个数据报缓存在 `pending` map 中。
+> 早期实现为每个入站连接新建 socket → 永远收不到已排队的数据报 → 测试死锁。不要改回那种写法。
+
+目前**只注册了 UDP**。其余 17 种传输按 AGENTS.md §9 逐步补齐。
+
+### 3.4 `core/crypto` — 身份与地址(覆盖率 87.0%)
+
+```go
+type KeyPair struct {
+    PrivateKey [32]byte
+    PublicKey  [32]byte
+}
+
+GenerateKeyPair() (*KeyPair, error)
+NewKeyPairFromPrivate(priv [32]byte) (*KeyPair, error)
+LoadOrGenerate(path string) (*KeyPair, error)
+Load(path string) (*KeyPair, error)
+Save(path string) error
+
+(k *KeyPair) NodeID() [16]byte              // SHA256(pubkey)[:16]
+(k *KeyPair) NodeIDHex() string
+(k *KeyPair) PublicKeyHex() string
+(k *KeyPair) SharedSecret(peerPub [32]byte) ([32]byte, error)
+
+NodeIDFromPublicKey(pub [32]byte) [16]byte
+DeriveVirtualIP(nodeID [16]byte, ipv4 bool) netip.Addr
+```
+
+决策与陷阱:
+
+- **密钥文件是裸 32 字节**,无 PEM/无头。理由:格式简单,减少解析分支与攻击面。
+- **文件权限强制 `0600`**(`KeyFileMode`),目录建议 `0700`(`KeyDirMode`)。权限不符时 `Load` 返回 `ErrKeyFilePerm`。
+  已有测试覆盖 `0o644/0o640/0o666/0o677/0o400` 全部拒绝,并验证**不会静默 chmod 修正**。
+- `Save` 采用 **临时文件 + fsync + rename** 保证原子性,不残留临时文件。
+- `ErrLowOrderPoint`:X25519 低阶点必须拒绝,否则共享密钥可被预测。错误信息由标准库给出,包装成 `ErrLowOrderPoint`。
+- ⚠️ **全零私钥是合法的**:X25519 的 clamping 会把全零私钥映射成一个有效的非零公钥
+  (`2fe57da347cd6243...`)。不要写"拒绝全零私钥"的测试。
+- ⚠️ `NodeIDHex` 内部必须 `id := k.NodeID()` 后再切片 —— Go 不允许对不可寻址的值取切片。
+
+**虚拟 IP 派生(`DeriveVirtualIP`)**:
+
+- IPv4:`10.126.<nodeID[0]>.<nodeID[1]>`
+- **保留位处理**:`{0, 1, 255}` 三个值全部映射到 `2`(避开网络地址 `.0`、网关保留 `.1`、广播 `.255`)
+- `10.126.126.1` 按 AGENTS.md §2 保留给控制面/网关
+- IPv6:`fd00:126:126::/64` + `nodeID[0:8]`,接口 ID 全零时提升为 `...:1`
+
+> ⚠️ 这里与最初的接口描述有分歧:描述写"`x.y = nodeID[0:2]`"直接拼接,
+> 但那样会产出 `.0` / `.255` 等非法地址。**当前实现遵循 AGENTS.md §8.2 的要求**(避开网络/广播地址)。
+> 代价是 `{0,1,2,255}` 四个输入映射到同一个值 `2`,存在 4 路碰撞;其余值一一对应。
+> 结果集恰好是 `[2, 254]` 共 253 个地址。测试中有精确断言。
+
+### 3.5 `core/session` — 加密会话(覆盖率 97.2%)
+
+三个文件:`session.go`(AEAD 会话)、`replay.go`(重放窗口)、`manager.go`(会话池)。
+
+**AEAD 与 nonce**
+
+- 算法:ChaCha20-Poly1305,`KeySize=32`、`NonceSize=12`、`TagSize=16`
+- nonce 构造:`SessionID(4 字节大端) || Sequence(8 字节大端)`
+  这与 AGENTS.md §8.7"由 SessionID 与 Sequence 组合"一致,且保证同一会话内不重用 nonce。
+
+**核心 API**
+
+```go
+NewSession(id uint32, sendKey, recvKey [32]byte) (*Session, error)
+NewSessionWithTTL(id uint32, sendKey, recvKey [32]byte, ttl time.Duration) (*Session, error)
+
+(s *Session) NextSequence() (uint64, error)
+(s *Session) Encrypt(seq uint64, plaintext, additionalData []byte) ([]byte, error)
+(s *Session) Decrypt(seq uint64, ciphertext, additionalData []byte) ([]byte, error)
+(s *Session) SealNext(plaintext, additionalData []byte) (uint64, []byte, error)  // ★ 并发安全
+(s *Session) Expired() bool
+(s *Session) Touch()
+(s *Session) Close()
+(s *Session) SetTTL(d time.Duration)
+
+NewSessionID() (uint32, error)
+DeriveSessionID(pubA, pubB [32]byte) uint32
+```
+
+> ★ **`SealNext` 是多 goroutine 并发发送时唯一正确的用法。**
+> `NextSequence()` 与 `Encrypt()` 是**两次独立加锁**。并发调用时两个阶段会交错:
+> goroutine A 取到序号 94、goroutine B 取到 99,但 B 先加密 → A 再加密时 94 低于高水位,
+> 被 nonce 重用防线**拒绝**,表现为随机丢包。
+> `SealNext` 把"取号 + 加密"合并进同一个临界区,彻底消除这个问题。
+> 单 goroutine 路径用 `NextSequence + Encrypt` 也没问题,但**新代码建议一律用 `SealNext`**。
+
+**`Decrypt` 的顺序是安全关键的**
+
+严格遵循"先验证、后提交":`Check(seq)`(不改状态) → AEAD 解密认证 → 通过后才 `Advance(seq)`。
+
+> ⚠️ **顺序颠倒会造成真实漏洞**:若先用序号占位再解密,攻击者只要不断发送伪造包,
+> 就能把合法序号一个个"吃掉",使真正的重传被判为重放而丢弃 —— 仅凭发垃圾包即可持续致盲链路。
+> 已有 `TestDecryptFailureDoesNotConsumeSequence` 专门守护这一点,**不要删**。
+
+**`Encrypt` 的 nonce 重用防线**(踩过两次坑)
+
+```go
+sendSeq  uint64  // 下一个"待分配"的序号,由 NextSequence 递增
+lastSent uint64  // 已实际"加过密"的最大序号 + 1
+```
+
+这两个字段**必须分开维护**。曾两次写错:
+
+1. 用 `seq < s.sendSeq` 判断 → 刚由 `NextSequence` 取出的 `seq == sendSeq-1` 被误判为已用
+   → **所有正常的"取号 → 加密"流程全部失败**。
+2. 改成 `seq < s.sendSeq-1` 后,又允许 `seq >= sendSeq` 时回写 `sendSeq`
+   → **重复加密同一序号不再被拒绝**,nonce 重用的防线失效。
+
+正确写法:与 `lastSent`(真正加密过的高水位)比较。
+
+**重放窗口(`ReplayWindow`)** — RFC 6479 风格
+
+```go
+NewReplayWindow(size uint64) (*ReplayWindow, error)   // size 必须是 64 的倍数且 > 0
+MustReplayWindow(size uint64) *ReplayWindow
+(w) Check(seq uint64) bool      // 只检查,不改状态
+(w) Advance(seq uint64)         // 提交
+(w) Accept(seq uint64) bool     // 原子 check+commit
+(w) Max() uint64
+(w) Reset()
+```
+
+- 默认 `DefaultWindowSize = 1024` 位(128 字节)
+- **首个包无条件接受**(序号可能很大:对端重启、长静默),否则会话永远无法开始
+- **单次前跳超过一个窗口宽度会被拒绝**:那种跳跃会掏空整个位图,使所有在途包变成"过老"
+- `Check` / `Advance` 分离是为了配合"解密失败不消耗序号"的语义
+
+**会话池(`Manager`)**
+
+```go
+NewManager() *Manager
+(m) Add(s *Session) (*Session, error)     // 返回被替换掉的旧会话
+(m) Get(id uint32) (*Session, bool)
+(m) GetByPeer(id [16]byte) (*Session, bool)
+(m) Remove(id uint32)
+(m) RemoveByPeer(id [16]byte)
+(m) GC(olderThan time.Duration) int
+(m) RunGC(ctx context.Context, interval time.Duration)
+(m) Len() int / IDs() []uint32 / All() []*Session
+(m) Close() error
+```
+
+- **不变量:一个对端同时只有一个活跃会话**。`Add` 发现同对端已有会话时,会关闭并移除旧的
+  (密钥轮换 / 重连 / 双向同时握手都会触发)。这条不变量很重要 —— 同对端两条会话会导致序号空间冲突与解密歧义。
+- `GC` 基于**最后活动时间**而非创建时间,长期繁忙的会话不会被误回收。
+- `IDs()` 返回**已排序**结果,保证测试与日志的稳定性。
+
+### 3.6 `core/handshake` — Noise IK 握手(覆盖率 91.5%)
+
+两个文件:`wire.go`(线格式 + MAC + 时间戳)、`handshake.go`(状态机)。
+
+- 密码套件:`Noise_IK_25519_ChaChaPoly_BLAKE2s`(AGENTS.md §8.5)
+- 库:`github.com/flynn/noise v1.1.0`
+
+**线格式**
+
+```
+偏移  长度  字段
+ 0     1    Type(1=Init, 2=Resp, 3=Complete)
+ 1     3    Reserved(必须为 0)
+ 4     4    SenderIndex
+ 8    12    Timestamp(Unix 纳秒,仅 Init 有)
+ ...    N    Noise 载荷
+ ...   16    MAC1
+ ...   16    MAC2
+```
+
+**握手流程(1-RTT + 1 条应用层确认)**
+
+```
+A(发起方)                                B(响应方)
+   │ NewInitiator(keyA, keyB.PublicKey)     │ NewResponder(keyB)
+   │                                        │
+   │── Init:  e, es, s, ss ───────────────▶ │ ReadMessage → 解出 A 公钥
+   │                                        │ WriteMessage
+   │ ◀───────────────── Resp: e, ee, se ────│ ★ 此处才产出密钥
+   │ ★ ReadMessage 后产出密钥                │
+   │ WriteMessage                           │
+   │── Complete ───────────────────────────▶ │ ReadMessage
+   │                                        │
+   │ A.Complete() == true                    │ B.Complete() == true
+```
+
+**★ 采纳密钥的时机(踩过大坑)**
+
+flynn/noise 只在**整个模式走完**时才 `Split()` 返回密钥。IK 有 **2 条** Noise 消息:
+
+- 响应方 `ReadMessage(msg1)` 之后 `msgIdx == 1 < 2` → **返回 nil 密钥**
+- 响应方 `WriteMessage(msg2)` → `msgIdx == 2` → **返回密钥** ✅
+- 发起方 `ReadMessage(msg2)` → **返回密钥** ✅
+
+最初把采纳点放在 `readInit`,拿到 nil,错误信息只有 `noise protocol failure`,极难定位。
+**不要移动这两个采纳点。**
+
+**★★ 密钥方向必须按角色镜像(最隐蔽的坑)**
+
+`flynn/noise` 的 `Split()` 返回 `(c1, c2)`,其中:
+
+- **`c1` 恒为「发起方发送」方向的密钥**
+- **`c2` 恒为「响应方发送」方向的密钥**
+- 这个顺序**与角色无关**,两端算出的 `(c1, c2)` 完全相同
+
+实测证据:
+
+```
+A.send == B.send   (都等于 c1)
+A.recv == B.recv   (都等于 c2)
+```
+
+因此**必须**按角色取舍:
+
+| 角色 | send | recv |
+|---|---|---|
+| 发起方 | `c1` | `c2` |
+| 响应方 | `c2` | `c1` |
+
+> ⚠️ 若两端都直接使用返回值,**握手本身会成功**(状态机能走到 Established),
+> 但双方用同一把密钥加密、另一把解密 → **第一次收发数据才表现为"解密失败"**。
+> 这种"握手成功但数据不通"的现象排查成本极高,务必记住。
+
+**其他安全设计**
+
+- **MAC1** 由**接收方公钥**派生(`DeriveMAC1Key`)。作用是证明发送方知道接收方公钥,
+  使未持有正确公钥的扫描流量无法激起昂贵的曲线运算(AGENTS.md §8.5 抗 DoS)。
+- **MAC2 / cookie**:`DeriveCookieKey(pub, remoteAddr)` 绑定来源地址,cookie 无法被重放到其它地址。
+  Phase 1a **只保留字段与校验路径**,`cookie` 传 `nil` 时写零值并跳过校验。完整 DoS 防护留到后续阶段。
+- **时间戳**:窗口 `TimestampWindow = 2 分钟`,配合 `timestampSeen` 集合做重放拒绝。
+- **Reserved 字段必须为 0**:它参与 MAC1 计算,拒绝非零值可防止未来版本用这段空间承载新语义时,
+  旧版本误把新消息当合法消息处理(降级攻击防护)。
+- **Prologue 绑定网络名称**:不同网络的节点即使共享密钥也无法互通,零额外往返。
+
+**常量**
+
+| 常量 | 值 | 来源 |
+|---|---|---|
+| `HandshakeTimeout` | `5s` | AGENTS.md §8.11 |
+| `HandshakeMaxRetry` | `5` | AGENTS.md §8.11 |
+
+**「第 3 条消息」的说明**
+
+Noise IK 本身**只有 2 条**消息。额外的 `MsgTypeComplete` 是**应用层确认**:
+让发起方明确知道响应方也已就绪,从而把状态机从 `Handshake` 推进到 `Direct`(AGENTS.md §8.9.1)。
+
+因此 `a.Complete()` 在**发出 Complete 之前**是 `false`,尽管此时密钥已经可用。
+这是有意设计,不是缺陷 —— `Session()` 在收到 Resp 后即可调用。
+
+**阶段常量**:`StageInit` / `StageSentInit` / `StageSentResp` / `StageEstablished`。
+(注:`StageSentResp` 目前未被使用,保留为对称占位。)
+
+### 3.7 `core/node` — 节点生命周期(覆盖率 99.3%)
+
+```go
+type Node struct { /* cfg, log, transport, listeners, running, closed, Hostname */ }
+
+New(Options{Config, Logger, Hostname, Transport}) (*Node, error)
+(n *Node) Run(ctx context.Context) error   // 阻塞
+(n *Node) Close() error
+(n *Node) Listeners() []transport.Listener
+(n *Node) Addrs() []net.Addr
+(n *Node) Config() *config.Config
+(n *Node) Transport() transport.Transport
+```
+
+- **零 CLI 依赖**,不 import cobra/pflag,不读 `os.Args`(AGENTS.md §3.2)。
+- 错误:`ErrAlreadyRunning`、`ErrNoListener`。
+- 现有测试用 `fakeTransport` / `fakeListener` 注入,共 41 个用例。
+
+**E2E 测试**(`e2e_test.go`,204 行):两个真实 UDP 节点互发 ZCPacket,
+`TestTwoNodesInterconnect` 做字段级断言,`TestTwoNodesExchangeBothDirections` 验证双向。
+
+> ⚠️ 这是 **Phase 0 的 E2E**:只验证了"两个节点能收发裸 ZCPacket"。
+> **Phase 1a 需要的"带握手加密的 E2E"尚未编写**(见 §5.4)。
+
+### 3.8 `cmd/mesh` — CLI 骨架(覆盖率 75.4%)
+
+文件:`main.go`、`cmd_root.go`、`cmd_node.go`、`cmd_version.go`、`cmd_test.go`。
+
+- 目前只有 `node` 与 `version` 两个子命令(**不是** AGENTS.md §11 的完整命令树)。
+- 全局 `-c/--config`(`StringArrayVarP`),`-v/--verbose` 挂在 **root 持久 flag** 上。
+- `version` / `commit` / `buildTime` 由 ldflags 注入。
+
+> ⚠️ **`cmd.Flags()` 的坑**:`cmd.Flags()` 只返回该子命令**自己**的 flag。
+> 若只 `Unmarshal(cmd.Flags())`,`--log.level` / `--log.format` 这类持久 flag 会被
+> **静默忽略**。必须:
+
+```go
+flags := cmd.Flags()
+flags.AddFlagSet(cmd.Root().PersistentFlags())
+```
+
+---
+
+## 4. 测试与覆盖率现状
+
+```
+ok  github.com/LiStudioorg/limesh/cmd/mesh        coverage: 75.4%
+ok  github.com/LiStudioorg/limesh/core/config     coverage: 89.3%
+ok  github.com/LiStudioorg/limesh/core/crypto     coverage: 87.0%
+ok  github.com/LiStudioorg/limesh/core/handshake  coverage: 91.5%
+ok  github.com/LiStudioorg/limesh/core/node       coverage: 99.3%
+ok  github.com/LiStudioorg/limesh/core/packet     coverage: 96.6%
+ok  github.com/LiStudioorg/limesh/core/session    coverage: 97.2%
+ok  github.com/LiStudioorg/limesh/core/transport  coverage: 85.2%
+```
+
+**验收门槛是每个包 ≥85%。** 当前只有 `cmd/mesh`(75.4%)未达标 —— 但 CLI 属于 Phase 1 的
+命令树工作,届时会一并补测。
+
+测试约定:
+
+- 标准库 `testing` + `testify/assert` + `testify/require`
+- 表驱动
+- 并发测试是**刻意加密的**,用于弥补本环境无法跑 `-race` 的缺口
+
+### 4.1 提交历史
+
+```
+d121c41 feat(handshake): implement Noise IK 1-RTT handshake
+3eba179 feat(session): add encrypted session and replay window
+f14c228 feat(crypto): add key pair management and NodeID derivation
+1a522d5 test: 补齐 node/CLI 测试并修复命令行 flag 未生效
+```
+
+---
+
+## 5. 未完成工作(按优先级)
+
+### 5.1 【最高优先级】`core/peer` — Peer 状态机
+
+**这是当前唯一的架构空洞。** AGENTS.md §8.9.1(注意:**不是** §8.12)定义了状态机:
+
+```
+Idle ──发现对端──▶ Handshake ──成功──▶ Direct ⇄ Relayed
+                       │                  ▲        │
+                    失败(重试耗尽)         │打洞成功  │打洞失败/超时
+                       ▼                  │        ▼
+                    Failed            ┌───┴────────┘
+                                      │  (Relayed 每 60s 重试打洞)
+                                      ▼
+                              Degraded(3 个 keepalive 周期 = 60s 无响应)
+                                      ▼
+                              Dead(6 个周期 = 120s 无响应)
+```
+
+**需要交付的文件**(按依赖顺序):
+
+```
+core/peer/peer.go        单个 Peer 的状态机
+core/peer/manager.go     全量 Peer 的注册表 + 定时驱动
+core/peer/peer_test.go   测试
+```
+
+**接口建议**(任务原始描述给出的常量块,请以此为准):
+
+```go
+type State int
+
+const (
+    StateIdle State = iota
+    StateHandshaking
+    StateProbing
+    StateDirect
+    StateRelay
+)
+```
+
+> ⚠️ **命名分歧需要你决策**:任务描述用 `Idle/Handshaking/Probing/Direct/Relay`,
+> 而 AGENTS.md §8.9.1 用 `Idle/Handshake/Direct/Relayed/Degraded/Dead/Failed`。
+> AGENTS.md 是项目内的**契约文档**(§2 明确"命名在项目内是契约,不允许各模块自行发明别名")。
+> **建议以 AGENTS.md 为准**,并在实现时把 `Probing` 对应到"打洞中"、`Degraded`/`Dead`/`Failed`
+> 作为额外状态补充进去;若采用任务描述的命名,请同步修订 AGENTS.md §8.9.1。
+
+**必须实现的常量**(来自 AGENTS.md §8.11):
+
+| 常量 | 值 |
+|---|---|
+| `KeepaliveInterval` | `20s` |
+| `PeerDegradedAfter` | `60s` |
+| `PeerDeadAfter` | `120s` |
+| `PunchTimeout` | `5s` |
+| `RepunchInterval` | `60s` |
+| `EWMAAlpha` | `0.2` |
+
+**设计要求**:
+
+- 每个 Peer 持有 `NodeID`、当前 `State`、活跃 `Session`、延迟 EWMA 样本
+- 状态转换必须**单向可审计**:每次转换记录旧状态、新状态、原因
+- 状态机本身**不直接收发网络包**,通过注入的接口驱动(便于测试)
+- 定时驱动放在 `manager.go`,用 ticker + `context` 取消
+- 打洞/中继在 Phase 1a **只做状态占位**,不实现真实打洞逻辑(见 §6 排除项)
+
+**测试重点**:
+
+- 全部合法转换路径
+- 非法转换被拒绝
+- 超时驱动的 Degraded → Dead 推进(用可注入的时钟!)
+- 并发安全
+
+> 💡 **强烈建议引入可注入时钟**(`now func() time.Time` 字段),否则超时测试要么慢要么不可靠。
+> `core/session` 里已有 `TTL` 模式可参考。
+
+### 5.2 `core/config` 补充 `[security]` 段
+
+`Config` 结构体目前**没有** `Security` 字段。需要按 **docs/CONFIG.md §6.8**(第 768 行起)添加:
+
+| 字段 | 类型 | 默认值 | 响应级别 |
+|---|---|---|---|
+| `security.e2ee` | bool | `true` | `restart` |
+| `security.key_rotation.interval` | duration | `168h` | `hot` |
+| `security.key_rotation.overlap` | duration | `24h` | `hot` |
+| `security.acl.default` | string | `allow` | hot |
+| `security.acl.rules` | table[] | — | hot |
+| `security.audit.enabled` | bool | `false` | hot |
+| `security.audit.path` | string | `/var/lib/mesh/audit.log` | hot |
+
+> ⚠️ **不要**用任务描述里那个 `enabled` / `key_file` / `key_rotation = "24h"` 的版本 ——
+> 它与 docs/CONFIG.md §6.8 冲突。**文档是契约,以实现文档为准。**
+
+配套工作:
+
+- `Default()` 里补默认值
+- `Validate()` 里校验范围(`interval` 1h~8760h,`overlap` 0~720h)
+- 补测试,覆盖率保持在 85% 以上
+
+### 5.3 `core/node` 集成(数据面主循环)
+
+`node.go` 目前只有生命周期管理,`grep handshake|session|peer` 只命中一行日志字段。
+需要集成:
+
+1. 启动时 `crypto.LoadOrGenerate` 加载/生成长期密钥
+2. 构造 `session.Manager` 与 `peer.Manager`
+3. **主循环按 ZCPacket `Type` 分派**:
+
+| Type | 处理 |
+|---|---|
+| `TypeHandshake` | 交给响应方 `Handshake.ReadMessage` |
+| `TypeHandshakeResp` | 交给发起方 `Handshake.ReadMessage` |
+| `TypeData` | 查 session → `Decrypt` → 投递给 Ingress(Phase 1a 可先丢弃/回显) |
+| `TypeKeepalive` | `session.Touch()`,喂给 peer 状态机 |
+| `TypeClose` | 关闭会话并清理 peer |
+| 其他 | 记日志丢弃 |
+
+4. 周期性 `sessionMgr.GC(0)`
+5. 关闭时有序清理:停止监听 → 关 peer → 关 session → 关 transport
+
+> ⚠️ **发送路径一律用 `Session.SealNext`**,不要用 `NextSequence + Encrypt`(见 §3.5)。
+> ⚠️ 解析用 `packet.Unmarshal`(零拷贝)时,底层 `[]byte` 必须在整包处理完之前保持存活。
+> UDP `Read` 通常复用同一个缓冲 —— **处理完再读下一个包**,或显式拷贝。
+
+### 5.4 `core/node/e2e_handshake_test.go`
+
+Phase 1a 的验收测试:**两个真实 UDP 节点完成握手并互发明文**。
+
+建议断言:
+
+1. 两端各自生成密钥,通过配置/`Peers` 互相认识
+2. A 发起握手,B 响应,双方 `Complete() == true`
+3. 双方 `RemoteNodeID()` 互为对方的 `NodeID()`
+4. 双方 `Session().ID` 相同
+5. A 发送加密 `TypeData`,B 解密后内容一致;反向同理
+6. 篡改密文后 B 解密失败且**不改会话状态**
+7. 重放同一个包被拒绝
+8. 会话 ID 与 `DeriveSessionID` 的独立复算一致
+
+### 5.5 提交切分要求
+
+Phase 1a 全部完成后,按 **5 个提交**切分,每个都必须能独立编译:
+
+```
+feat(crypto): ...        # 已存在:f14c228
+feat(handshake): ...     # 已存在:d121c41
+feat(session): ...       # 已存在:3eba179
+feat(peer): add peer state machine and manager
+feat(node): integrate handshake, session and peer into node data path
+```
+
+> ⚠️ 前三个提交已推送。**不要重写历史**,只需新增后两个。
+
+---
+
+## 6. 明确的排除项(Phase 1a 不做)
+
+**不要**为了实现下面的东西而扩大改动面 —— 它们属于后续阶段:
+
+- ❌ TUN / gVisor 接入层(`internal/ingress/`)
+- ❌ OSPF 路由计算与 LSA 泛洪
+- ❌ NAT 打洞(STUN / ICE / UPnP / 端口预测 / 生日悖论)
+- ❌ 中继转发实现
+- ❌ ACL 引擎
+- ❌ Prometheus 指标
+- ❌ Docker / K8s 部署产物
+- ❌ CLI 完整命令树(AGENTS.md §11 的 11 个子命令)
+- ❌ 除 UDP 外的 17 种传输
+- ❌ 密钥轮换的实际执行(只保留配置字段与 `security.e2ee` 开关)
+
+Phase 1a 的目标边界:**两个节点能完成 Noise 握手,建立加密会话,互发加密数据包**。
+
+---
+
+## 7. 踩坑清单(按痛苦程度排序)
+
+这一节是本文档最有价值的部分。**每一条都真实发生过**,都消耗了实际调试时间。
+
+### 7.1 密码学与协议类(最贵)
+
+| # | 坑 | 现象 | 正确做法 |
+|---|---|---|---|
+| 1 | **Noise 密钥方向未按角色镜像** | 握手成功,但**所有数据包解密失败** | 发起方 `(c1,c2)`,响应方 `(c2,c1)`。见 §3.6 |
+| 2 | **过早采纳 Noise 密钥** | `noise protocol failure (nil cipher state)` | 只在最后一条 Noise 消息后采纳。IK 是第 2 条 |
+| 3 | **`Encrypt` 序号判断用 `sendSeq`** | 所有正常加密被拒 `seq 0 already used` | 与独立的 `lastSent` 高水位比较 |
+| 4 | **修完 #3 后允许回写 `sendSeq`** | 重复序号**不再被拒绝**,防线失效 | 两字段严格分离,不回写 |
+| 5 | **`NextSequence + Encrypt` 并发使用** | 随机丢包,报 `seq already used` | 并发发送必须用 `SealNext` |
+| 6 | **`Decrypt` 先占序号再解密** | 攻击者发垃圾包即可致盲链路 | 先 check → 解密 → 成功后才 advance |
+| 7 | **假定全零私钥非法** | 测试失败:X25519 clamping 使其合法 | 不要写这个假设 |
+| 8 | **X25519 低阶点错误信息不匹配** | 断言 `ErrLowOrderPoint` 失败 | 标准库文案是 `crypto/ecdh: bad X25519 remote ECDH input: low order point`,用 `strings.Contains` 归一化 |
+
+### 7.2 并发类
+
+| # | 坑 | 现象 |
+|---|---|---|
+| 9 | 测试中跨 `wg` 波次读切片元素 | 数据竞争;改用 `sealed` 结构体数组,每 goroutine 独占下标 |
+| 10 | `TestReplayWindowConcurrentDuplicates` 需要互斥保护 `map` | 竞态;`-race` 下会报 |
+
+> ⚠️ **本环境无法运行 `-race`**(无 gcc)。接手后**第一件事**:
+> 装好 gcc,运行 `go test -race ./...`,重点看 `core/session` 与 `core/handshake`。
+> 当前并发测试是"肉眼 + 逻辑"保障的,`-race` 可能仍会发现遗漏。
+
+### 7.3 Go 语言类
+
+| # | 坑 | 正确做法 |
+|---|---|---|
+| 11 | `cannot slice unaddressable value k.NodeID()` | 先 `id := k.NodeID()` 再 `id[:]` |
+| 12 | nil 指针解引用 | 测试里对 nil `*KeyPair` 调用 `kp.PublicKey` 会 panic(Go 语义,非缺陷);只在 nil 安全的方法上做测试 |
+| 13 | `cmd.Flags()` 不含持久 flag | `flags.AddFlagSet(cmd.Root().PersistentFlags())` |
+| 14 | `env.Provider(prefix, ".", Opt{...})` 签名错 | 真实签名是 `env.Provider(delim string, o Opt)`,`Opt.Prefix` 是字段 |
+| 15 | `toMap` 产出大写字段名 | 会导致默认层与其他层键名不匹配;必须按 struct tag 显式构造嵌套 map |
+| 16 | `toml` 包名与局部变量冲突 | 别名 `gotoml "github.com/pelletier/go-toml/v2"` |
+| 17 | 未使用的 import 导致构建失败 | 每次改完跑 `go vet` |
+| 18 | `assert.Equal([]byte{}, nil)` 判不等 | 空载荷用 `assert.Len` + `bytes.Equal`,或用 `require.Empty` |
+| 19 | 子测试名用 `rune('0'+size%10)` 会碰撞 | 用 `fmt.Sprintf("size=%d", size)` |
+| 20 | `assert.ObjectsAreEqual(err, err)` 是无意义的占位 | 我犯过两次,应直接断言 `ErrorIs` |
+
+### 7.4 测试自我欺骗类
+
+| # | 坑 | 说明 |
+|---|---|---|
+| 21 | 断言与自己的设计矛盾 | 例:断言"发起方收到 Resp 后 `Complete()` 为 true",但设计上要等发出 Complete。**断言错了,不是代码错了** |
+| 22 | `require.NoError` 写在期望报错处 | 复制粘贴导致。例:响应方读 Resp 应报错,却写成 `NoError` |
+| 23 | 测试遗漏协议步骤 | 忘了发 Complete 消息,然后断言 `Complete() == true` 失败 |
+| 24 | 碰撞容许逻辑写得太松 | IPv4 派生测试中"1 与 2 都派生出 2"其实是合法的;改用精确映射断言 |
+
+> 💡 **教训**:测试失败时,**先判断是代码错还是断言错**。上面 21–24 全部是断言错。
+
+### 7.5 环境类
+
+| # | 坑 | 现象 |
+|---|---|---|
+| 25 | `$HOME` 不可写 | go 无法写缓存;必须 export 工作区内的 `GOCACHE`/`GOMODCACHE`/`GOPATH` |
+| 26 | 无 `gcc` | `-race` 不可用 |
+| 27 | 无 `make` | `Makefile` 未验证 |
+| 28 | 无 root | 不能 `apt-get install` |
+
+### 7.6 文档与实现的分歧(需要你决策)
+
+| # | 任务描述/旧接口说 | 文档实际说 | 当前取舍 |
+|---|---|---|---|
+| 29 | AGENTS.md §8.12/8.13/8.14 | **不存在**。Peer 状态机在 §8.9.1,安全在 §8.10,常量在 §8.11 | 按实际章节 |
+| 30 | `[security]` 用 `enabled`/`key_file`/`key_rotation="24h"` | docs/CONFIG.md §6.8 用 `e2ee`/`key_rotation.interval`/`key_rotation.overlap` | **以文档为准** |
+| 31 | 状态名 `Idle/Handshaking/Probing/Direct/Relay` | AGENTS.md §8.9.1:`Idle/Handshake/Direct/Relayed/Degraded/Dead/Failed` | **待你决策**(§5.1) |
+| 32 | `DeriveVirtualIP` 直接 `10.126.nodeID[0].nodeID[1]` | AGENTS.md §8.2 要求避开网络/广播地址 | 按文档实现(见 §3.4) |
+| 33 | "消息 3: HandshakeComplete" | IK 只有 2 条 Noise 消息 | 第 3 条是应用层确认(见 §3.6) |
+| 34 | 目录树 `internal/...` | 实际是 `core/...` | **按实际 `core/`**(见 §2) |
+| 35 | 18 种传输全都实现 | 只实现了 UDP | 按路线图分期 |
+
+---
+
+## 8. 立即上手指南
+
+### 8.1 第一条命令
+
+```bash
+cd /home/li63050a/work/limesh
+
+export GOCACHE=/home/li63050a/work/limesh/.gocache
+export GOMODCACHE=/home/li63050a/work/limesh/.gomodcache
+export GOPATH=/home/li63050a/work/limesh/.gopath
+export GOFLAGS=-mod=mod
+
+go build ./... && go test ./... -cover
+```
+
+期望:全部 `ok`,覆盖率与 §4 一致。
+
+### 8.2 推荐推进顺序
+
+```
+第 1 步  装 gcc,跑 go test -race ./... ,修掉所有竞态     ← 先做这个
+第 2 步  core/config 补 [security] 段 + 测试               (独立,风险低)
+第 3 步  core/peer 状态机 + manager + 测试                  ← 核心
+第 4 步  core/node 集成数据面主循环
+第 5 步  core/node/e2e_handshake_test.go                    ← 验收
+第 6 步  go build / go test / 交叉编译 arm64
+第 7 步  两个提交:feat(peer) / feat(node),然后 push
+```
+
+### 8.3 验收标准(Phase 1a)
+
+全部满足才算完成:
+
+- [ ] `go build ./...` 通过
+- [ ] `go test ./...` 全部通过
+- [ ] `go test -race ./...` 通过(**需要先装 gcc**;若装不上,必须在报告中明确声明这是环境限制)
+- [ ] `go test -run TestHandshake ./core/node/ -v` 通过(E2E 握手)
+- [ ] 每个包覆盖率 ≥85%
+- [ ] `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...` 通过
+- [ ] `gofmt -l .` 输出为空
+- [ ] `go vet ./...` 干净
+- [ ] 两个节点能握手、能互发加密数据包、能识别对端 NodeID
+
+### 8.4 最终报告应包含
+
+1. 新增/修改文件清单
+2. 各包覆盖率数字
+3. `-race` 结果(或明确说明环境限制)
+4. 交叉编译结果
+5. 遇到的问题与做的决策(尤其是 §7.6 的分歧如何处理)
+6. 下一步建议
+
+---
+
+## 9. 编码规范(强制)
+
+| 规范 | 说明 |
+|---|---|
+| 注释语言 | **中文** |
+| 导出符号 | **每个都必须有 godoc 注释** |
+| 错误处理 | `fmt.Errorf` + `%w` 包装,支持 `errors.Is` |
+| 日志 | 只用 `zap`;**core 包内禁止 `fmt.Println`** |
+| CLI 依赖 | `core/` 下**禁止** import `cobra`/`pflag` |
+| CGO | `CGO_ENABLED=0` 必须能编译。**禁止引入 C 依赖** |
+| 许可证 | 依赖必须与 Apache 2.0 兼容,**禁止 GPL/AGPL** |
+| 测试 | 标准库 `testing` + `testify/assert`/`require` |
+| 格式化 | `gofmt`;提交前必须跑 |
+| 提交信息 | 英文,`type(scope): subject` 格式 |
+
+### 9.1 写文件的方式
+
+**分批增量写入,不要一次性写巨大文件。** 已验证可行的模式:
+
+```bash
+cat > path/file.go <<'GOEOF'
+...第一批内容...
+GOEOF
+cat >> path/file.go <<'GOEOF'
+...第二批内容...
+GOEOF
+echo "exit=$? lines=$(wc -l < path/file.go)"
+```
+
+---
+
+## 10. 关键设计决策速查
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 包头 | 固定 48 字节 | 零拷贝解析、缓冲复用 |
+| 数据面可靠性 | 不重传 | 避免双重可靠性,内层协议负责 |
+| nonce 构造 | SessionID + Sequence | 保证同会话不重用 |
+| 重放窗口 | RFC 6479 位图,1024 位 | 内存小、O(1) |
+| 解密顺序 | 先验证后提交 | 防伪造包吞噬序号 |
+| 握手 | Noise IK,1-RTT | 前向保密 + 双向认证 |
+| 应用层确认 | 额外第 3 条消息 | 让双方对"就绪"达成共识 |
+| 会话 ID | 双方公钥确定性派生 | 双向同时握手可去重 |
+| 单对端单会话 | `Manager.Add` 强制替换 | 避免序号空间冲突 |
+| 虚拟 IP | 由 NodeID 派生 | 无需 DHCP、无中央协调 |
+| 虚拟 IP 保留位 | `{0,1,255}` → `2` | 避开网络/广播/网关地址 |
+| 密钥文件 | 裸 32 字节,强制 0600 | 格式简单、减少攻击面 |
+| MAC1 | 由接收方公钥派生 | 抗 DoS:扫描流量无法触发昂贵运算 |
+| 时间戳窗口 | 2 分钟 | 容忍漂移,同时有实际防护意义 |
+| Prologue | 绑定网络名 | 零往返的网络隔离 |
+
+---
+
+## 11. 快速索引
+
+| 想了解 | 看这里 |
+|---|---|
+| 技术方案总览 | [AGENTS.md](</AGENTS.md>) |
+| 配置系统细节 | [docs/CONFIG.md](</docs/CONFIG.md>) |
+| 18 种传输协议 | [docs/TRANSPORT.md](</docs/TRANSPORT.md>) |
+| 用户使用说明 | [README.md](</README.md>) |
+| 配置样例 | [config.example.toml](</config.example.toml>) |
+| 包结构 | `core/*`、`cmd/mesh` |
+| 状态机定义 | AGENTS.md §8.9.1(第 591 行) |
+| 协议常量 | AGENTS.md §8.11(第 643 行) |
+| 握手规范 | AGENTS.md §8.5(第 475 行) |
+| 安全字段 | docs/CONFIG.md §6.8(第 768 行) |
+
+---
+
+## 12. 已知的技术债
+
+| # | 债 | 影响 | 建议 |
+|---|---|---|---|
+| 1 | `go.mod` 声明 `go 1.26.0` | 与 AGENTS.md §7 的 "1.22+" 不一致 | 确认目标版本后统一 |
+| 2 | `Makefile` 从未运行 | 可能是坏的 | 有 `make` 后立刻验证 |
+| 3 | `cmd/mesh` 覆盖率 75.4% | 低于 85% 门槛 | 随命令树补齐 |
+| 4 | `StageSentResp` 常量未使用 | 死代码 | 实现或删除 |
+| 5 | `ErrTimestampReplay` 在部分路径与阶段错误重叠 | 错误分类不够精确 | 细化 |
+| 6 | cookie / MAC2 的完整 DoS 防护未实现 | 抗 DoS 能力不完整 | Phase 2 补全 |
+| 7 | 无真实打洞/中继 | `Relayed` 状态无法真实进入 | Phase 2 |
+| 8 | `ReplayWindow.Advance` 是公开方法 | 可能被误用(绕过 Check) | 考虑改名或收紧 |
+| 9 | `core/node` 尚未接入加密数据面 | 当前 E2E 仍是明文 ZCPacket | §5.3 |
+
+---
+
+## 13. 最后的话
+
+这个项目有一个显著特点:**文档先行且极其详尽**。AGENTS.md 有 1331 行,CONFIG.md 有 1825 行,
+TRANSPORT.md 有 1558 行。它们是**契约**,不是参考。
+
+因此当你的直觉与文档冲突时:
+
+1. **先查文档**。多数情况下文档是对的(比如 §7.6 的 #30)。
+2. 如果确认文档有误,**修订文档**并在提交信息里说明,而不是让代码与文档长期偏离。
+3. `AGENTS.md §3` 的八条设计原则是**评审否决依据**,违反任何一条的改动不予合入。
+
+最大的两个陷阱已经在 §7.1 里写清楚了 —— **Noise 密钥方向**和**采纳时机**。
+这两个错误都会表现为"握手看起来成功了但数据不通",而且错误信息毫无指向性。
+如果你要重新实现握手部分,**先把这两条读三遍**。
+
+祝顺利。
