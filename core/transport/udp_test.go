@@ -364,3 +364,161 @@ func TestUDPErrorsAreWrapped(t *testing.T) {
 	assert.True(t, errors.Is(err, err) || err != nil, "错误应非空")
 	assert.Contains(t, err.Error(), "udp dial", "错误应带上下文")
 }
+
+// ---------------------------------------------------------------------------
+// DatagramConn 能力
+// ---------------------------------------------------------------------------
+
+func TestUDPListenerImplementsDatagram(t *testing.T) {
+	tr := NewUDP(Options{})
+	ln, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	dg, ok := AsDatagram(ln)
+	require.True(t, ok, "UDP 监听器应实现 DatagramConn")
+	assert.NotNil(t, dg.LocalAddr())
+}
+
+func TestAsDatagramNilAndUnsupported(t *testing.T) {
+	dg, ok := AsDatagram(nil)
+	assert.False(t, ok)
+	assert.Nil(t, dg)
+
+	dg, ok = AsDatagram(notDatagram{})
+	assert.False(t, ok)
+	assert.Nil(t, dg)
+}
+
+// notDatagram 是仅实现 Listener 的最小类型。
+type notDatagram struct{}
+
+func (notDatagram) Accept(context.Context) (Conn, error) { return nil, ErrClosed }
+func (notDatagram) Addr() net.Addr                       { return &net.UDPAddr{} }
+func (notDatagram) Close() error                         { return nil }
+
+func TestUDPDatagramRoundTrip(t *testing.T) {
+	tr := NewUDP(Options{})
+
+	lnA, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+	defer lnA.Close()
+
+	lnB, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+	defer lnB.Close()
+
+	dgA, ok := AsDatagram(lnA)
+	require.True(t, ok)
+	dgB, ok := AsDatagram(lnB)
+	require.True(t, ok)
+
+	// A → B
+	_, err = dgA.WriteTo([]byte("hello-b"), lnB.Addr())
+	require.NoError(t, err)
+
+	require.NoError(t, dgB.SetReadDeadline(time.Now().Add(testTimeout)))
+	buf := make([]byte, 1500)
+	n, from, err := dgB.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello-b", string(buf[:n]))
+	assert.Equal(t, lnA.Addr().String(), from.String())
+
+	// B → A
+	_, err = dgB.WriteTo([]byte("hello-a"), from)
+	require.NoError(t, err)
+
+	require.NoError(t, dgA.SetReadDeadline(time.Now().Add(testTimeout)))
+	n, _, err = dgA.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello-a", string(buf[:n]))
+}
+
+func TestUDPDatagramWriteToBadAddrType(t *testing.T) {
+	tr := NewUDP(Options{})
+	ln, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	dg, ok := AsDatagram(ln)
+	require.True(t, ok)
+
+	_, err = dg.WriteTo([]byte("x"), badAddr{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported addr type")
+}
+
+// badAddr 是不受支持的 net.Addr 实现。
+type badAddr struct{}
+
+func (badAddr) Network() string { return "bad" }
+func (badAddr) String() string  { return "bad" }
+
+func TestUDPDatagramAfterClose(t *testing.T) {
+	tr := NewUDP(Options{})
+	ln, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+
+	dg, ok := AsDatagram(ln)
+	require.True(t, ok)
+
+	require.NoError(t, dg.Close())
+
+	_, _, err = dg.ReadFrom(make([]byte, 10))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = dg.WriteTo([]byte("x"), ln.Addr())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrClosed)
+}
+
+// TestUDPListenerConnAccessors 覆盖 Accept 返回连接的 LocalAddr/Stats/SetReadDeadline。
+func TestUDPListenerConnAccessors(t *testing.T) {
+	tr := NewUDP(Options{})
+	ln, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	client, err := tr.Dial(ctx, ln.Addr().String())
+	require.NoError(t, err)
+	defer client.Close()
+
+	_, err = client.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	conn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	assert.NotNil(t, conn.LocalAddr())
+	assert.NotNil(t, conn.RemoteAddr())
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(testTimeout)))
+
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(buf[:n]))
+
+	stats := conn.Stats()
+	assert.GreaterOrEqual(t, stats.BytesRecv, uint64(5))
+}
+
+// TestUDPAcceptRespectsContextDeadline 覆盖 applyDeadline 带 deadline 的分支。
+func TestUDPAcceptRespectsContextDeadline(t *testing.T) {
+	tr := NewUDP(Options{})
+	ln, err := tr.Listen("127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	// 无人发送数据报,Accept 应在 deadline 后返回错误。
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err = ln.Accept(ctx)
+	require.Error(t, err)
+}

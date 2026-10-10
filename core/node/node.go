@@ -10,10 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/LiStudioorg/limesh/core/config"
+	"github.com/LiStudioorg/limesh/core/crypto"
+	"github.com/LiStudioorg/limesh/core/peer"
+	"github.com/LiStudioorg/limesh/core/session"
 	"github.com/LiStudioorg/limesh/core/transport"
 )
 
@@ -42,6 +46,14 @@ type Node struct {
 
 	// Hostname 是本节点的有效主机名(配置为空时由调用方提供的回退值)。
 	Hostname string
+
+	// dp 是加密数据面。未配置长期密钥时为 nil,此时节点退化为 Phase 0 的
+	// 裸传输行为(仅监听,不握手)。
+	dp *datapath
+	// keyPair 是本节点长期身份密钥。
+	keyPair *crypto.KeyPair
+	// peerSpecs 是待连接的已知对端(地址 + 公钥)。
+	peerSpecs []PeerSpec
 }
 
 // Options 是构造 Node 的参数。
@@ -56,6 +68,15 @@ type Options struct {
 	// Transport 允许注入自定义传输实现(测试用途)。
 	// 为空时按配置中的监听协议自动构造。
 	Transport transport.Transport
+	// KeyPair 是本节点长期身份密钥。为空时退化为无加密数据面的裸节点。
+	KeyPair *crypto.KeyPair
+	// Peers 是已知对端列表(地址 + 公钥)。用于在 Run 时主动发起握手。
+	Peers []PeerSpec
+	// OnPlaintext 是数据包解密成功后的回调。为空时明文被丢弃。
+	//
+	// Phase 1a 用它把明文交付给测试或临时消费者;Ingress 接入后由 Ingress
+	// 取代这一回调。回调在数据面读循环内同步调用,实现必须尽快返回。
+	OnPlaintext func(srcID [crypto.NodeIDSize]byte, plaintext []byte)
 }
 
 // New 按配置装配一个节点。
@@ -75,9 +96,23 @@ func New(opts Options) (*Node, error) {
 	}
 
 	node := &Node{
-		cfg:      opts.Config,
-		log:      log,
-		Hostname: opts.Config.HostnameOr(opts.Hostname),
+		cfg:       opts.Config,
+		log:       log,
+		Hostname:  opts.Config.HostnameOr(opts.Hostname),
+		keyPair:   opts.KeyPair,
+		peerSpecs: append([]PeerSpec(nil), opts.Peers...),
+	}
+
+	if opts.KeyPair != nil {
+		cv := &configView{
+			networkName: opts.Config.Network.Name,
+			prologue:    []byte(opts.Config.Network.Name),
+			e2ee:        opts.Config.Security.E2EE,
+		}
+		node.dp = newDatapath(opts.KeyPair, cv, log)
+		if opts.OnPlaintext != nil {
+			node.dp.setPlaintextHandler(opts.OnPlaintext)
+		}
 	}
 
 	tr := opts.Transport
@@ -164,14 +199,18 @@ func (n *Node) Run(ctx context.Context) error {
 		)
 	}
 
+	// 若已配置长期密钥,则启动加密数据面。
+	dpDone := n.startDatapath(ctx, started)
+
 	n.log.Info("mesh node running",
 		zap.String("name", n.cfg.Network.Name),
 		zap.String("hostname", n.Hostname),
 		zap.Int("listeners", len(started)),
 		zap.Strings("peers", n.cfg.Peers),
+		zap.Bool("encrypted", n.dp != nil),
 	)
 
-	// 阻塞至上下文取消。Phase 0 尚无后台任务,因此只需等待信号。
+	// 阻塞至上下文取消。
 	<-ctx.Done()
 
 	n.mu.Lock()
@@ -183,10 +222,55 @@ func (n *Node) Run(ctx context.Context) error {
 		zap.String("reason", context.Cause(ctx).Error()),
 	)
 
+	// 先停数据面再关监听器:数据面读循环依赖监听 socket 存活。
+	if dpDone != nil {
+		<-dpDone
+	}
+
 	if err := n.Close(); err != nil {
 		return fmt.Errorf("node: run: shutdown: %w", err)
 	}
 	return nil
+}
+
+// startDatapath 把支持数据报的监听器接入数据面并启动它,返回其结束信号。
+//
+// 未配置密钥、或没有任何监听器支持数据报模式时返回 nil,节点保持 Phase 0
+// 的裸传输行为。
+func (n *Node) startDatapath(ctx context.Context, listeners []transport.Listener) <-chan struct{} {
+	if n.dp == nil {
+		return nil
+	}
+
+	datagrams := 0
+	for _, l := range listeners {
+		dg, ok := transport.AsDatagram(l)
+		if !ok {
+			continue
+		}
+		n.dp.addDatagram(dg)
+		n.dp.registerDatagramAddr(l.Addr().String(), dg)
+		datagrams++
+	}
+	if datagrams == 0 {
+		n.log.Warn("no datagram-capable listener; encrypted data path disabled")
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.dp.run(ctx)
+	}()
+
+	// 主动向已知对端发起握手。
+	for _, spec := range n.peerSpecs {
+		if err := n.dp.initiate(spec); err != nil {
+			n.log.Warn("initiate handshake failed",
+				zap.String("peer", spec.Addr), zap.Error(err))
+		}
+	}
+	return done
 }
 
 // startListeners 按配置启动监听器,遇到错误时返回已成功启动的部分。
@@ -229,6 +313,72 @@ func (n *Node) closeListeners(ls []transport.Listener) {
 	}
 }
 
+// RuntimeStart 在后台启动节点并等待监听器就绪。
+//
+// 它是 Run 的非阻塞封装:Run 仍然阻塞直到 ctx 取消,这里是给需要"启动后
+// 立即返回、自行控制生命周期"的调用方(典型是测试与嵌入式场景)使用的。
+//
+// 返回时监听器已启动;若启动失败,错误会原样返回,后台 goroutine 不会
+// 遗留未处理的 panic。
+func (n *Node) RuntimeStart(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() { done <- n.Run(ctx) }()
+
+	// 等待监听器出现;期间若 Run 提前返回错误,立即上报。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if len(n.Listeners()) > 0 {
+			return nil
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+			return nil
+		case <-time.After(5 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node: runtime start: listeners not ready")
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+}
+
+// Sessions 返回会话池;未配置密钥时返回 nil。
+func (n *Node) Sessions() *session.Manager {
+	if n.dp == nil {
+		return nil
+	}
+	return n.dp.Sessions()
+}
+
+// Peers 返回对端注册表;未配置密钥时返回 nil。
+func (n *Node) Peers() *peer.Manager {
+	if n.dp == nil {
+		return nil
+	}
+	return n.dp.Peers()
+}
+
+// LocalNodeID 返回本节点身份;未配置密钥时返回零值。
+func (n *Node) LocalNodeID() [crypto.NodeIDSize]byte {
+	if n.dp == nil {
+		return [crypto.NodeIDSize]byte{}
+	}
+	return n.dp.LocalNodeID()
+}
+
+// SendData 使用对端会话加密并发送一个数据包。
+func (n *Node) SendData(peerID [crypto.NodeIDSize]byte, plaintext []byte) error {
+	if n.dp == nil {
+		return ErrNoKeyPair
+	}
+	return n.dp.SendData(peerID, plaintext)
+}
+
 // Close 关闭全部监听器。重复调用是安全的。
 func (n *Node) Close() error {
 	n.mu.Lock()
@@ -239,7 +389,14 @@ func (n *Node) Close() error {
 	n.closed = true
 	listeners := n.listeners
 	n.listeners = nil
+	dp := n.dp
 	n.mu.Unlock()
+
+	// 数据面可能在 Run 之外被直接关闭(例如构造后未 Run 即 Close),
+	// 这里做幂等兜底。
+	if dp != nil {
+		dp.shutdown()
+	}
 
 	n.closeListeners(listeners)
 	return nil

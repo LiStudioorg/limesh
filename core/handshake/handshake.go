@@ -595,6 +595,25 @@ func (h *Handshake) Session() (*session.Session, error) {
 	return h.session, nil
 }
 
+// DetachSession 取回握手建立的会话,并把所有权移交给调用方。
+//
+// 必须在调用 Close 之前使用:Close 会关闭握手内部持有的会话以缩短密钥
+// 驻留时间。当上层需要继续使用该会话(加入会话池)时,应先用 DetachSession
+// 取得所有权,使后续 Close 不再影响它。
+//
+// 重复调用返回同一个会话;会话未被创建时返回 ErrIncomplete。
+func (h *Handshake) DetachSession() (*session.Session, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.session == nil {
+		return nil, fmt.Errorf("handshake: detach session: %w", ErrIncomplete)
+	}
+	s := h.session
+	h.session = nil
+	return s, nil
+}
+
 // PeerNodeIDMatches 报告握手得到的对端身份是否与预期一致。
 func (h *Handshake) PeerNodeIDMatches(expected [crypto.NodeIDSize]byte) bool {
 	h.mu.Lock()

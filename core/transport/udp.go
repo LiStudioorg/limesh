@@ -389,6 +389,56 @@ func (l *udpListener) applyDeadline(ctx context.Context) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// DatagramConn 实现
+//
+// udpListener 同时满足 DatagramConn,使数据面可以在一个端口上收发任意来源的
+// 数据报(以 SrcNodeID 区分对端),而不必为每个对端 Accept 一条连接。
+// 这两条路径互不干扰:Accept/Conn 仍为需要连接语义的调用方保留。
+// ---------------------------------------------------------------------------
+
+// ReadFrom 读取一个数据报并返回来源地址。不做任何来源过滤。
+func (l *udpListener) ReadFrom(p []byte) (int, net.Addr, error) {
+	if l.closed.Load() {
+		return 0, nil, fmt.Errorf("transport: udp readfrom: %w", ErrClosed)
+	}
+	n, addr, err := l.conn.ReadFromUDP(p)
+	if err != nil {
+		if l.closed.Load() {
+			return 0, nil, fmt.Errorf("transport: udp readfrom: %w", ErrClosed)
+		}
+		return 0, nil, fmt.Errorf("transport: udp readfrom: %w", err)
+	}
+	return n, addr, nil
+}
+
+// WriteTo 向 addr 发送一个数据报。
+func (l *udpListener) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if l.closed.Load() {
+		return 0, fmt.Errorf("transport: udp writeto: %w", ErrClosed)
+	}
+	uaddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("transport: udp writeto: unsupported addr type %T", addr)
+	}
+	n, err := l.conn.WriteToUDP(p, uaddr)
+	if err != nil {
+		return n, fmt.Errorf("transport: udp writeto: %w", err)
+	}
+	return n, nil
+}
+
+// SetReadDeadline 设置读截止时间,复用 Conn 的语义。
+func (l *udpListener) SetReadDeadline(t time.Time) error {
+	if err := l.conn.SetReadDeadline(t); err != nil {
+		return fmt.Errorf("transport: udp listener set deadline: %w", err)
+	}
+	return nil
+}
+
+// LocalAddr 是 DatagramConn 要求的访问器,与 Addr 返回同一地址。
+func (l *udpListener) LocalAddr() net.Addr { return l.conn.LocalAddr() }
+
 // Addr 返回监听地址。
 func (l *udpListener) Addr() net.Addr { return l.conn.LocalAddr() }
 
