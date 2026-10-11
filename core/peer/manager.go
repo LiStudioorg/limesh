@@ -191,6 +191,54 @@ func (m *Manager) SessionOf(id [crypto.NodeIDSize]byte) (*session.Session, bool)
 	return s, s != nil
 }
 
+// BroadcastFunc 是向单个对端发送一段载荷的函数。
+//
+// Manager 只负责"选择哪些对端",具体发送由调用方注入,避免 Manager 依赖
+// 数据面/传输。返回错误时 Broadcast 会继续尝试其余对端(尽力而为)。
+type BroadcastFunc func(peerID [crypto.NodeIDSize]byte, payload []byte) error
+
+// Broadcast 向所有已建立会话(活跃)的对端发送同一份载荷。
+//
+// 仅选择处于 Direct 或 Relayed 状态、且持有活跃会话的对端:LSA/探测这类
+// 控制信息需要真正的双向可达路径。返回成功发送的对端数。
+func (m *Manager) Broadcast(payload []byte, send BroadcastFunc) int {
+	return m.broadcastExcept(nil, payload, send)
+}
+
+// BroadcastExcept 向除 except 之外的所有活跃对端发送载荷。
+//
+// 用于 LSA 洪泛:收到某邻居的 LSA 后转发给其余邻居,不回发给来源,
+// 避免立即回环(AGENTS.md 8.6.2)。返回成功发送的对端数。
+func (m *Manager) BroadcastExcept(except [crypto.NodeIDSize]byte, payload []byte, send BroadcastFunc) int {
+	return m.broadcastExcept(&except, payload, send)
+}
+
+// broadcastExcept 是 Broadcast/BroadcastExcept 的公共实现。
+func (m *Manager) broadcastExcept(except *[crypto.NodeIDSize]byte, payload []byte, send BroadcastFunc) int {
+	if send == nil {
+		return 0
+	}
+
+	var sent int
+	for _, p := range m.All() {
+		if except != nil && p.NodeID == *except {
+			continue
+		}
+		state := p.State()
+		if state != StateDirect && state != StateRelayed && state != StateDegraded {
+			continue
+		}
+		if p.Session() == nil {
+			continue
+		}
+		if err := send(p.NodeID, payload); err != nil {
+			continue
+		}
+		sent++
+	}
+	return sent
+}
+
 // Tick 对所有 Peer 执行一次超时推进,返回发生状态变化的 Peer 数量。
 //
 // 上层可周期性调用它(例如每次保活唤醒时),也可由 RunTicker 自动驱动。

@@ -41,6 +41,21 @@ const (
 	// DefaultIngressInterface 是默认 TUN 接口名。
 	DefaultIngressInterface = "mesh0"
 
+	// DefaultRoutingStrategy 是默认选路策略。
+	DefaultRoutingStrategy = "shortest"
+	// DefaultLSAFloodInterval 是默认 LSA 泛洪周期。
+	DefaultLSAFloodInterval = 30 * time.Second
+	// DefaultLSAMaxAge 是默认 LSA 失效时间。
+	DefaultLSAMaxAge = 300 * time.Second
+	// DefaultProbeInterval 是默认链路探测周期。
+	DefaultProbeInterval = 1 * time.Second
+	// DefaultEWMAAlpha 是默认延迟平滑系数。
+	DefaultEWMAAlpha = 0.2
+	// DefaultHeartbeat 是默认心跳周期。
+	DefaultHeartbeat = 5 * time.Second
+	// DefaultStaleTimeout 是默认陈旧超时。
+	DefaultStaleTimeout = 20 * time.Second
+
 	// DefaultKeyRotationInterval 是密钥轮换的默认周期。
 	DefaultKeyRotationInterval = 168 * time.Hour
 	// DefaultKeyRotationOverlap 是密钥轮换时新旧密钥的默认重叠窗口。
@@ -153,6 +168,8 @@ type Config struct {
 	Ingress IngressConfig `koanf:"ingress"`
 	// TUN 是 TUN 设备配置。
 	TUN TUNConfig `koanf:"tun"`
+	// Routing 是路由与路径选择配置。
+	Routing RoutingConfig `koanf:"routing"`
 	// Path 记录配置来源文件,供排错与来源追踪使用,不参与序列化。
 	Path string `koanf:"-"`
 }
@@ -213,6 +230,30 @@ type TUNConfig struct {
 	Name string `koanf:"name"`
 }
 
+// RoutingConfig 描述路由与路径选择(docs/CONFIG.md 6.7)。
+//
+// 字段命名以本 Phase 的实现为准;CONFIG.md 6.7 用 lsa_interval /
+// keepalive_interval / peer_degraded_after 等表达相近概念,后续阶段会统一。
+type RoutingConfig struct {
+	// Strategy 是选路策略:shortest / latency / weighted。
+	Strategy string `koanf:"strategy"`
+	// EWMAAlpha 是延迟平滑系数,范围 (0,1]。
+	EWMAAlpha float64 `koanf:"ewma_alpha"`
+	// LSAFloodInterval 是 LSA 周期泛洪间隔。
+	LSAFloodInterval time.Duration `koanf:"lsa_flood_interval"`
+	// LSAMaxAge 是 LSA 失效时间。
+	LSAMaxAge time.Duration `koanf:"lsa_max_age"`
+	// ProbeInterval 是链路质量探测周期。
+	ProbeInterval time.Duration `koanf:"probe_interval"`
+	// Heartbeat 是心跳周期。
+	Heartbeat time.Duration `koanf:"heartbeat"`
+	// StaleTimeout 是判定链路陈旧的超时。
+	StaleTimeout time.Duration `koanf:"stale_timeout"`
+}
+
+// validRoutingStrategies 是合法的选路策略取值。
+var validRoutingStrategies = []string{"shortest", "latency", "weighted"}
+
 // 接入模式取值。
 const (
 	// IngressModeTUN 表示使用内核 TUN 设备(需要 CAP_NET_ADMIN / root)。
@@ -272,6 +313,15 @@ func Default() *Config {
 			Interface: DefaultIngressInterface,
 		},
 		TUN: TUNConfig{},
+		Routing: RoutingConfig{
+			Strategy:         DefaultRoutingStrategy,
+			EWMAAlpha:        DefaultEWMAAlpha,
+			LSAFloodInterval: DefaultLSAFloodInterval,
+			LSAMaxAge:        DefaultLSAMaxAge,
+			ProbeInterval:    DefaultProbeInterval,
+			Heartbeat:        DefaultHeartbeat,
+			StaleTimeout:     DefaultStaleTimeout,
+		},
 	}
 }
 
@@ -330,6 +380,34 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: validate: ingress.mode %q not in %v", c.Ingress.Mode, validIngressModes)
 	}
 
+	if err := c.Routing.validate(); err != nil {
+		return fmt.Errorf("config: validate: routing: %w", err)
+	}
+
+	return nil
+}
+
+// validate 校验 [routing] 段的取值范围(docs/CONFIG.md 6.7)。
+func (r RoutingConfig) validate() error {
+	if !contains(validRoutingStrategies, r.Strategy) {
+		return fmt.Errorf("strategy %q not in %v", r.Strategy, validRoutingStrategies)
+	}
+	if r.EWMAAlpha <= 0 || r.EWMAAlpha > 1 {
+		return fmt.Errorf("ewma_alpha %v out of range (0, 1]", r.EWMAAlpha)
+	}
+	if r.LSAFloodInterval <= 0 {
+		return fmt.Errorf("lsa_flood_interval must be positive, got %v", r.LSAFloodInterval)
+	}
+	if r.LSAMaxAge <= 0 {
+		return fmt.Errorf("lsa_max_age must be positive, got %v", r.LSAMaxAge)
+	}
+	if r.LSAMaxAge < r.LSAFloodInterval {
+		return fmt.Errorf("lsa_max_age %v must not be shorter than lsa_flood_interval %v",
+			r.LSAMaxAge, r.LSAFloodInterval)
+	}
+	if r.ProbeInterval <= 0 {
+		return fmt.Errorf("probe_interval must be positive, got %v", r.ProbeInterval)
+	}
 	return nil
 }
 

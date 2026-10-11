@@ -19,6 +19,7 @@ import (
 	"github.com/LiStudioorg/limesh/core/ingress"
 	"github.com/LiStudioorg/limesh/core/packet"
 	"github.com/LiStudioorg/limesh/core/peer"
+	"github.com/LiStudioorg/limesh/core/route"
 	"github.com/LiStudioorg/limesh/core/session"
 	"github.com/LiStudioorg/limesh/core/transport"
 )
@@ -143,12 +144,29 @@ func New(opts Options) (*Node, error) {
 	}
 
 	if opts.KeyPair != nil {
+		rc := opts.Config.Routing
 		cv := &configView{
-			networkName: opts.Config.Network.Name,
-			prologue:    []byte(opts.Config.Network.Name),
-			e2ee:        opts.Config.Security.E2EE,
+			networkName:   opts.Config.Network.Name,
+			prologue:      []byte(opts.Config.Network.Name),
+			e2ee:          opts.Config.Security.E2EE,
+			strategy:      rc.Strategy,
+			ewmaAlpha:     rc.EWMAAlpha,
+			lsaFloodEvery: rc.LSAFloodInterval,
+			lsaMaxAge:     rc.LSAMaxAge,
+			probeInterval: rc.ProbeInterval,
 		}
 		node.dp = newDatapath(opts.KeyPair, cv, log)
+
+		// 链路质量探测:发送器复用数据面的控制包发送路径。
+		prober, err := route.NewProber(route.ProberOptions{
+			Sender:    node.dp.probeSender(),
+			Interval:  rc.ProbeInterval,
+			EWMAAlpha: rc.EWMAAlpha,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("node: new: prober: %w", err)
+		}
+		node.dp.prober = prober
 
 		// 明文投递:装配了 Ingress 时交给 Ingress 写回 TUN;否则用注入的回调。
 		switch {
@@ -333,22 +351,29 @@ func (n *Node) forwardIngressToDataPath(ctx context.Context) {
 	}
 }
 
-// forwardOne 处理一个来自 TUN 的 IP 包:查对端 → 加密 → 发送。
+// forwardOne 处理一个来自 TUN 的 IP 包:解析目的节点 → 查路由 → 发送。
+//
+// Phase 1c 起不再硬编码单 peer:目的节点由 IP 头解析(反查虚拟 IP 映射),
+// 下一跳由转发表决定,因此支持透明多跳(A → B → C)。
 func (n *Node) forwardOne(pkt *packet.ZCPacket) {
-	peerID, ok, err := n.dp.DirectPeer()
-	if err != nil {
-		n.log.Debug("ingress forward: no route", zap.Error(err))
-		return
-	}
-	if !ok {
-		// 尚无已建立会话的对端:握手未完成,丢弃。
-		n.log.Debug("ingress forward: no peer session yet, dropping packet")
+	payload := pkt.Payload()
+	if len(payload) == 0 {
 		return
 	}
 
-	if err := n.dp.SendData(peerID, pkt.Payload()); err != nil {
+	dst, err := n.dp.resolveDstNodeID(payload)
+	if err != nil {
+		n.log.Debug("ingress forward: cannot resolve destination",
+			zap.Int("len", len(payload)), zap.Error(err))
+		return
+	}
+	if dst == n.dp.localID {
+		return
+	}
+
+	if err := n.dp.SendToNode(dst, payload); err != nil {
 		n.log.Debug("ingress forward: send failed",
-			zap.String("peer", crypto.NodeIDString(peerID)), zap.Error(err))
+			zap.String("dst", crypto.NodeIDString(dst)), zap.Error(err))
 	}
 }
 
@@ -381,6 +406,13 @@ func (n *Node) startDatapath(ctx context.Context, listeners []transport.Listener
 		defer close(done)
 		n.dp.run(ctx)
 	}()
+
+	// L5 路由后台任务:泛洪本节点 LSA、老化拓扑库、周期探测链路质量。
+	go n.dp.runLSAFlooder(ctx)
+	go n.dp.runLSAAger(ctx)
+	if n.dp.prober != nil {
+		go n.dp.prober.Run(ctx)
+	}
 
 	// 主动向已知对端发起握手。
 	for _, spec := range n.peerSpecs {
@@ -480,6 +512,30 @@ func (n *Node) Peers() *peer.Manager {
 		return nil
 	}
 	return n.dp.Peers()
+}
+
+// RouteTo 查询到目的 NodeID 的路由;未配置数据面时返回 false。
+func (n *Node) RouteTo(dst [crypto.NodeIDSize]byte) (route.RouteEntry, bool) {
+	if n.dp == nil {
+		return route.RouteEntry{}, false
+	}
+	return n.dp.RouteTo(dst)
+}
+
+// RouteTable 返回当前转发表;未配置数据面时返回 nil。
+func (n *Node) RouteTable() *route.RouteTable {
+	if n.dp == nil {
+		return nil
+	}
+	return n.dp.RouteTable()
+}
+
+// Topology 返回链路状态数据库;未配置数据面时返回 nil。
+func (n *Node) Topology() *route.TopologyDB {
+	if n.dp == nil {
+		return nil
+	}
+	return n.dp.Topology()
 }
 
 // LocalNodeID 返回本节点身份;未配置密钥时返回零值。

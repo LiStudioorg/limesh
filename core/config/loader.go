@@ -404,6 +404,15 @@ func toMap(c *Config) map[string]any {
 		"tun": map[string]any{
 			"name": c.TUN.Name,
 		},
+		"routing": map[string]any{
+			"strategy":           c.Routing.Strategy,
+			"ewma_alpha":         c.Routing.EWMAAlpha,
+			"lsa_flood_interval": c.Routing.LSAFloodInterval.String(),
+			"lsa_max_age":        c.Routing.LSAMaxAge.String(),
+			"probe_interval":     c.Routing.ProbeInterval.String(),
+			"heartbeat":          c.Routing.Heartbeat.String(),
+			"stale_timeout":      c.Routing.StaleTimeout.String(),
+		},
 	}
 }
 

@@ -334,11 +334,12 @@ func TestDispatchKeepaliveAndClose(t *testing.T) {
 func TestDispatchIgnoresUnknownType(t *testing.T) {
 	dp, _, _ := newTestDatapath(t)
 
+	// Punch / Relay 属后续阶段,当前应被静默忽略。
 	pkt := packet.New(nil)
-	pkt.SetType(packet.TypeLSA)
+	pkt.SetType(packet.TypePunch)
 	require.NoError(t, dp.dispatch(pkt, &net.UDPAddr{}))
 
-	pkt.SetType(packet.TypePunch)
+	pkt.SetType(packet.TypeRelay)
 	require.NoError(t, dp.dispatch(pkt, &net.UDPAddr{}))
 }
 
@@ -356,7 +357,11 @@ func TestHandleDataNoSession(t *testing.T) {
 	assert.Contains(t, err.Error(), "no session")
 }
 
-func TestHandleDataWrongDestination(t *testing.T) {
+// TestHandleDataTransitNoRoute 验证目的为他节点且无路由时进入转发路径并报错。
+//
+// Phase 1c 起,目的不是本节点的包不再直接丢弃,而是尝试逐跳转发;
+// 无路由时返回明确错误。
+func TestHandleDataTransitNoRoute(t *testing.T) {
 	dp, _, _ := newTestDatapath(t)
 
 	s, err := session.NewSession(0x1111, [32]byte{1}, [32]byte{2})
@@ -375,7 +380,8 @@ func TestHandleDataWrongDestination(t *testing.T) {
 
 	err = dp.handleData(pkt, &net.UDPAddr{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not us")
+	// 进入转发路径,先尝试解密(密文过短),而非"不是发给本节点"。
+	assert.Contains(t, err.Error(), "transit")
 }
 
 func TestHandleDataDecryptFailure(t *testing.T) {

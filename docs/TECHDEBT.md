@@ -148,20 +148,54 @@ Phase 3 的 no-tun 模式接入后,`OnPlaintext` 可彻底移除,统一为 Ingre
 
 ---
 
-## 6. Phase 1b 两点直连路由是临时实现
+## 6. ✅ 已关闭:单点路由已由 OSPF 替换(Phase 1c)
+
+**现状(已解决)**
+
+Phase 1b 的硬编码单 peer 路由(`datapath.DirectPeer`)已被 `core/route` 的
+OSPF 子集替换:出站包按目的虚拟 IP 解析 NodeID,查转发表选下一跳,支持
+透明多跳(A → B → C)。
+
+`DirectPeer` 仍保留作为便捷访问器(单一直接邻居场景),但数据面不再依赖它。
+
+---
+
+## 7. Phase 1c 采用逐跳转发而非源路由
 
 **现状**
 
-`datapath.DirectPeer` 要求恰好存在一个活跃会话:0 个则丢弃出站包,
-多于 1 个则报"路由歧义"错误。这是 Phase 1b"两点直连"的约定。
+多跳数据采用**逐跳加密与转发**:中间节点解密本跳、按路由表选定下一跳、
+再重新加密转发,`ZCPacket` 的 Src/Dst 保持端到端语义。
 
 **影响**
 
-三个及以上节点时,出站 IP 包无法判断下一跳,`DirectPeer` 返回错误、
-包被丢弃。多节点组网不可用。
+- 中间节点能看到内层明文 IP 包(逐跳解密),因此多跳路径上的中间节点
+  并非 E2EE 的信任边界之外 —— 这与 AGENTS.md 8.6.4"中继不可解密"的
+  目标存在张力。
+- 每一跳都要做一次加解密,CPU 开销随跳数线性增长。
+
+**原因**
+
+Phase 1c 尚无 A ↔ C 的端到端握手(A 只与直接邻居 B 握手),因此没有
+可用于端到端加密的共享会话。逐跳转发是当前拓扑下的最小可行实现。
 
 **建议方向**
 
-Phase 1c 实现 OSPF(链路状态泛洪 + Dijkstra)与路由表后,出站包按目的
-虚拟 IP 查表选下一跳,`DirectPeer` 退化为"唯一直接邻居"的便捷访问器或移除。
-详见 AGENTS.md §12.3。
+Phase 2/5 引入源路由或逐跳密钥协商:源节点与目的节点建立端到端会话,
+中间节点仅按 DstNodeID 转发密文(不解密)。届时 `sendViaHop` 改为
+"用端到端会话加密 + 按下一跳发送"。
+
+---
+
+## 8. Phase 1c Cost 仅计跳数 + RTT
+
+**现状**
+
+链路度量 `route.Cost(rtt) = HopCost(10) + RTT_ms`,未计入丢包率。
+`latency` 策略已接收 `lossRate` 参数并在 `Weight` 中叠加 `loss×1000`,
+但 `Prober` 的丢包率尚未回填到 LSA 的 Cost。
+
+**建议方向**
+
+Phase 5 的 weighted/latency 策略完善时,把丢包率纳入 LSA Cost:
+`cost = hop_cost + RTT_ms + loss_rate × 1000`(AGENTS.md 8.6)。

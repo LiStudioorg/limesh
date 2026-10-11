@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -159,9 +160,14 @@ func TestHandshakeTamperedCiphertextRejected(t *testing.T) {
 	require.True(t, ok)
 
 	// 直接用 B 的会话解密一段非法密文应当失败。
+	//
+	// 说明:Phase 1c 起控制流量(LSA/探测)会占用会话序号,故失败原因可能是
+	// 认证失败(ErrDecrypt)或序号已被占用(ErrReplay);两者都证明该伪造包
+	// 被拒绝,断言以"被拒绝"为准。
 	_, err := sessB.Decrypt(0, []byte("not-a-valid-ciphertext-payload-xx"), buildAAD(idA, idB, sessB.ID))
-	require.Error(t, err, "篡改密文必须解密失败")
-	assert.ErrorIs(t, err, session.ErrDecrypt)
+	require.Error(t, err, "篡改密文必须被拒绝")
+	assert.True(t, errors.Is(err, session.ErrDecrypt) || errors.Is(err, session.ErrReplay),
+		"应为认证失败或重放拒绝,实际: %v", err)
 
 	// 失败后合法数据仍可到达:序号未被伪造包占用。
 	require.NoError(t, p.A.SendData(idB, []byte("legit after tamper")))

@@ -663,11 +663,31 @@ ewma_new = α × sample + (1 - α) × ewma_old
 | `Probing` / `Relayed` | ⚠️ 状态占位 | `Driver.StartPunch` 无真实打洞逻辑;`Probing → Relayed` 仅在打洞超时被触发,不产生真实中继流量 |
 | 对端公钥 | ⚠️ 手工注入 | Noise IK 要求发起方预知响应方公钥。Phase 1a 无控制面/发现通道,由调用方通过 `node.PeerSpec{Addr, PublicKey}` 显式注入。Phase 2 控制面完成后自动下发 |
 | 重新打洞 | ⚠️ 状态流转可用 | `RepunchInterval` 节流与状态转换已实现,但底层无真实打洞可重试 |
-| 路由 / LSA / 中继 / ACL | ❌ 未实现 | 属 Phase 2 及以后 |
+| 路由 / LSA / 中继 / ACL | ⚠️ 部分 | 路由与 LSA 属 Phase 1c(见 §8.9.4);中继与 ACL 属 Phase 2 及以后 |
 
 **结论**:Phase 1a 的边界是"两个节点能完成 Noise 握手、建立加密会话、互发加密
 数据包"。打洞、中继、控制面下发公钥均在 Phase 2 落地;在那之前,`Probing` 与
 `Relayed` 只承载状态机语义,不代表真实可达的传输路径。
+
+#### 8.9.4 Phase 1c 实现现状(OSPF 子集)
+
+截至 Phase 1c,`core/route` 已实现 §8.6.2 / §8.8 的链路状态路由子集:
+
+| 能力 | Phase 1c 状态 | 说明 |
+|---|---|---|
+| LSA 编解码 | ✅ 已实现 | 线格式见 `core/route/lsa.go`,序号 + Age 判定新旧 |
+| 拓扑库 | ✅ 已实现 | `TopologyDB`,版本号驱动重算,超龄 LSA 自动清除 |
+| LSA 泛洪 | ✅ 已实现 | 收到更新的 LSA 转发给除来源外的邻居,序号去重防环路 |
+| Dijkstra | ✅ 已实现 | `Compute` 生成转发表;单向声明的链路不构成邻接 |
+| 策略 | ⚠️ 部分 | `shortest` / `latency` 可用;`weighted` 仅保留接口(Phase 5) |
+| 链路探测 | ✅ 已实现 | Probe/ProbeAck + EWMA 平滑 RTT |
+| 透明多跳 | ✅ 已实现 | A-B-C 直线拓扑下 A 可经 B 中转至 C |
+| 故障收敛 | ✅ 已实现 | 中间节点掉线后其 LSA 超龄被清除,依赖它的路由消失 |
+| E2EE 中继 | ⚠️ 逐跳解密 | Phase 1c 采用逐跳转发,中间节点可见明文(见 TECHDEBT #7) |
+
+**验收边界**:三个节点直线拓扑(A—B—C,A 与 C 不直连)能通过 LSA 收敛,
+A 经 B 中转到 C;B 掉线后 A、C 重新收敛为不可达。打洞、真实中继、多路径
+属 Phase 2/5。
 
 ### 8.10 安全考虑
 
@@ -1063,7 +1083,7 @@ no-tun 模式:
 | 权限错误提示 | ✅ 已实现 | 权限不足时给出按平台(含 setcap/Docker/K8s)的修复指引 |
 | `no-tun` 模式 | ❌ 未实现 | 返回 `ErrNotImplemented`,Phase 3 落地 |
 | `auto` 降级 | ⚠️ 部分 | 权限不足时打印明确的降级提示,但 no-tun 未实现,故仍返回错误而非真正降级 |
-| 路由 | ⚠️ 两点直连 | 出站包一律发给唯一活跃对端(`DirectPeer`);多对端时报歧义错误。完整 OSPF 属 Phase 1c |
+| 路由 | ✅ OSPF 子集 | Phase 1c 已实现链路状态泛洪 + Dijkstra + 转发表,支持 A-B-C 透明多跳。详见 §8.9.4 |
 
 **平台差异**:Linux 用 `mesh0`、macOS 用系统分配的 `utun*`、Windows 用 Wintun 的
 `mesh`、FreeBSD/OpenBSD 用 `tun*`。设备名解析优先级:`tun.name` > `ingress.interface`

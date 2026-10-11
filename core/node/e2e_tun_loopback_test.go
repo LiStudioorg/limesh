@@ -21,8 +21,16 @@ type ingressNode struct {
 	dev  *device.FakeDevice
 }
 
-// newIngressNode 构造一个装配了假 TUN 的节点。
+// newIngressNode 构造一个装配了假 TUN 的节点(默认路由参数)。
 func newIngressNode(t *testing.T, name string, kp *crypto.KeyPair, peers []PeerSpec) *ingressNode {
+	t.Helper()
+	return newIngressNodeWithRouting(t, name, kp, peers, nil)
+}
+
+// newIngressNodeWithRouting 构造假 TUN 节点,并允许自定义路由参数。
+//
+// mutate 在配置校验前调用,便于测试使用较短的老化/泛洪周期而无需长等待。
+func newIngressNodeWithRouting(t *testing.T, name string, kp *crypto.KeyPair, peers []PeerSpec, mutate func(*config.Config)) *ingressNode {
 	t.Helper()
 
 	cfg := config.Default()
@@ -30,6 +38,9 @@ func newIngressNode(t *testing.T, name string, kp *crypto.KeyPair, peers []PeerS
 	cfg.Network.Hostname = name
 	cfg.Listen = []config.ListenConfig{{Addr: "udp://127.0.0.1:0"}}
 	cfg.Peers = []string{}
+	if mutate != nil {
+		mutate(cfg)
+	}
 	require.NoError(t, cfg.Validate())
 
 	dev := device.NewFakeDevice(name+"-tun", cfg.Network.MTU)
@@ -86,16 +97,11 @@ func TestTunLoopbackEndToEnd(t *testing.T) {
 		return nodeA.node.Peers().Len() > 0 && nodeB.node.Peers().Len() > 0
 	}, 5*time.Second, 10*time.Millisecond, "双方应完成握手")
 
-	// 构造一个"从 A 发往 B 的虚拟 IP"的 IP 包(内容无关,只验证搬运)。
-	ipPacket := []byte{
-		0x45, 0x00, 0x00, 0x1c, // IPv4, IHL=5, total length=28
-		0x00, 0x01, 0x00, 0x00, // ID, flags
-		0x40, 0x01, 0x00, 0x00, // TTL=64, proto=ICMP, checksum
-		0x0a, 0x7e, 0x7e, 0x01, // src 10.126.126.1
-		0x0a, 0x7e, 0x7e, 0x02, // dst 10.126.126.2
-		0x08, 0x00, 0x00, 0x00, // ICMP echo
-		0x00, 0x01, 0x00, 0x01, // id/seq
-	}
+	// 用双方 NodeID 派生的真实虚拟 IP 构造 IP 包(内容无关,只验证搬运)。
+	vipA := crypto.DeriveVirtualIP(keyA.NodeID(), true).As4()
+	vipB := crypto.DeriveVirtualIP(keyB.NodeID(), true).As4()
+
+	ipPacket := ipv4Packet(vipA, vipB, []byte{0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01})
 
 	// 模拟内核把包写入 A 的 TUN。
 	nodeA.dev.Inbound <- ipPacket
@@ -109,10 +115,7 @@ func TestTunLoopbackEndToEnd(t *testing.T) {
 	}
 
 	// 反向:A 也应能收到 B 的 IP 包。
-	reply := make([]byte, len(ipPacket))
-	copy(reply, ipPacket)
-	reply[12], reply[13], reply[14], reply[15] = 0x0a, 0x7e, 0x7e, 0x02 // src = B
-	reply[16], reply[17], reply[18], reply[19] = 0x0a, 0x7e, 0x7e, 0x01 // dst = A
+	reply := ipv4Packet(vipB, vipA, []byte{0x08, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02})
 
 	nodeB.dev.Inbound <- reply
 	select {
@@ -121,6 +124,22 @@ func TestTunLoopbackEndToEnd(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("A 未在超时内收到 B 投递的 IP 包")
 	}
+}
+
+// ipv4Packet 构造一个最小 IPv4 包(IHL=5,无选项),payload 附在 20 字节头之后。
+func ipv4Packet(src, dst [4]byte, payload []byte) []byte {
+	total := 20 + len(payload)
+	pkt := make([]byte, total)
+	pkt[0] = 0x45 // version 4, IHL 5
+	pkt[1] = 0x00
+	pkt[2] = byte(total >> 8)
+	pkt[3] = byte(total)
+	pkt[8] = 0x40 // TTL 64
+	pkt[9] = 0x01 // ICMP
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	copy(pkt[20:], payload)
+	return pkt
 }
 
 // TestIngressForwardingRequiresSession 验证握手前写入 TUN 的包被丢弃,

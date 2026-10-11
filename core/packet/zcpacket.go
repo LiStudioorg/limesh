@@ -48,6 +48,8 @@ const (
 	TypeProbe
 	// TypeClose 是关闭包,承载原因码。
 	TypeClose
+	// TypeProbeAck 是探测确认包,回显探测时间戳(Phase 1c 引入)。
+	TypeProbeAck
 )
 
 // Flags 位标志,取值见 AGENTS.md 第 8.3 节。
@@ -359,6 +361,8 @@ func TypeName(t byte) string {
 		return "relay"
 	case TypeProbe:
 		return "probe"
+	case TypeProbeAck:
+		return "probe-ack"
 	case TypeClose:
 		return "close"
 	default:

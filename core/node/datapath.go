@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,6 +16,7 @@ import (
 	"github.com/LiStudioorg/limesh/core/handshake"
 	"github.com/LiStudioorg/limesh/core/packet"
 	"github.com/LiStudioorg/limesh/core/peer"
+	"github.com/LiStudioorg/limesh/core/route"
 	"github.com/LiStudioorg/limesh/core/session"
 	"github.com/LiStudioorg/limesh/core/transport"
 )
@@ -80,6 +83,29 @@ type datapath struct {
 	// 这里会替换为"把明文 IP 包写入内核或用户态栈"。
 	onPlaintext func(srcID [crypto.NodeIDSize]byte, plaintext []byte)
 
+	// ---- L5 路由(Phase 1c) ----
+
+	// topology 是链路状态数据库。
+	topology *route.TopologyDB
+	// routeTable 是按拓扑计算出的转发表。
+	//
+	// 用 atomic.Pointer 承载:recomputeRoutes 会整表替换,而数据面读循环
+	// (SendToNode/RouteTo)会并发读取。整表替换 + 原子指针保证读到的永远是
+	// 一份完整快照,且无数据竞争。
+	routeTable atomic.Pointer[route.RouteTable]
+	// strategy 是选路策略。
+	strategy route.Strategy
+	// prober 是链路质量探测器,可为 nil。
+	prober *route.Prober
+	// lsa 是本节点当前发布的 LSA(含序号)。
+	lsaMu     sync.Mutex
+	selfLSA   *route.LSA
+	seenLSA   map[[crypto.NodeIDSize]byte]uint32 // origin -> 已处理的最大序号
+	routeHook func()                             // 拓扑变化时的通知回调,可为 nil
+
+	// onRouteChange 在转发表重算后被调用,用于日志/测试观测,可为 nil。
+	onRouteChange func(*route.RouteTable)
+
 	closed   bool
 	closeMu  sync.Mutex
 	stopOnce sync.Once
@@ -92,6 +118,13 @@ type configView struct {
 	networkName string
 	prologue    []byte
 	e2ee        bool
+
+	// 路由参数。
+	strategy      string
+	ewmaAlpha     float64
+	lsaFloodEvery time.Duration
+	lsaMaxAge     time.Duration
+	probeInterval time.Duration
 }
 
 // newDatapath 构造数据面。
@@ -99,7 +132,23 @@ func newDatapath(local *crypto.KeyPair, cv *configView, log *zap.Logger) *datapa
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &datapath{
+
+	maxAge := uint16(0)
+	if cv != nil && cv.lsaMaxAge > 0 {
+		secs := int(cv.lsaMaxAge / time.Second)
+		if secs > 0xFFFF {
+			secs = 0xFFFF
+		}
+		maxAge = uint16(secs)
+	}
+
+	strategy, err := route.NewStrategy(strategyName(cv))
+	if err != nil {
+		// 配置校验已保证策略合法;此处兜底到 shortest。
+		strategy, _ = route.NewStrategy("shortest")
+	}
+
+	d := &datapath{
 		cfg:      cv,
 		local:    local,
 		localID:  local.NodeID(),
@@ -109,8 +158,25 @@ func newDatapath(local *crypto.KeyPair, cv *configView, log *zap.Logger) *datapa
 		addrToDg: map[string]transport.DatagramConn{},
 		inflight: map[string]*inflight{},
 		byIndex:  map[uint32]*inflight{},
+		topology: route.NewTopologyDB(maxAge),
+		strategy: strategy,
+		seenLSA:  map[[crypto.NodeIDSize]byte]uint32{},
 		stopCh:   make(chan struct{}),
 	}
+
+	d.routeTable.Store(route.NewRouteTable())
+
+	d.selfLSA = route.NewLSA(d.localID)
+	d.selfLSA.SeqNo = 1
+	return d
+}
+
+// strategyName 从配置视图取策略名,空配置回退为 shortest。
+func strategyName(cv *configView) string {
+	if cv == nil || cv.strategy == "" {
+		return "shortest"
+	}
+	return cv.strategy
 }
 
 // LocalNodeID 返回本节点身份。
@@ -266,6 +332,63 @@ func (d *datapath) SendData(peerID [crypto.NodeIDSize]byte, plaintext []byte) er
 		return err
 	}
 	return d.sendRaw(pkt, addr)
+}
+
+// SendToNode 把一段明文 IP 包发送到目的节点 dst。
+//
+// 与 SendData 的区别:SendToNode 先查路由表确定下一跳(可能是多跳),
+// 再逐跳发送;SendData 是"直连单跳"的便捷路径。二者都使用逐跳加密,
+// ZCPacket 的 Src/Dst 保持端到端语义。
+func (d *datapath) SendToNode(dst [crypto.NodeIDSize]byte, plaintext []byte) error {
+	if dst == d.localID {
+		return fmt.Errorf("node: send to node: destination is self")
+	}
+	rt := d.routeTable.Load()
+	if rt == nil {
+		return fmt.Errorf("node: send to node: route table not ready")
+	}
+	entry, ok := rt.Lookup(dst)
+	if !ok {
+		return fmt.Errorf("node: send to node: no route to %s", crypto.NodeIDString(dst))
+	}
+	return d.sendViaHop(entry.NextHop, d.localID, dst, plaintext)
+}
+
+// resolveDstNodeID 从 IP 包解析目的节点的 NodeID。
+//
+// 虚拟 IP 由 NodeID 派生(AGENTS.md 8.2),该映射不可逆;因此这里反向
+// 枚举已知节点(拓扑库 + 直接邻居),比较各自派生的虚拟 IP 是否匹配。
+//
+// 仅支持 IPv4:Phase 1c 的验收场景是 IPv4 虚拟网段。IPv6 与更大规模的
+// 直接索引(建立 IP→NodeID 哈希表)留待后续阶段。
+func (d *datapath) resolveDstNodeID(ipPacket []byte) ([crypto.NodeIDSize]byte, error) {
+	var zero [crypto.NodeIDSize]byte
+
+	dstIP, err := dstIPv4(ipPacket)
+	if err != nil {
+		return zero, err
+	}
+
+	// 先查自己。
+	if crypto.DeriveVirtualIP(d.localID, true) == dstIP {
+		return d.localID, nil
+	}
+
+	// 候选集合:所有直接邻居 + 拓扑库中的全部节点。
+	candidates := make(map[[crypto.NodeIDSize]byte]struct{})
+	for _, p := range d.peers.All() {
+		candidates[p.NodeID] = struct{}{}
+	}
+	for _, l := range d.topology.Snapshot() {
+		candidates[l.Origin] = struct{}{}
+	}
+
+	for id := range candidates {
+		if crypto.DeriveVirtualIP(id, true) == dstIP {
+			return id, nil
+		}
+	}
+	return zero, fmt.Errorf("node: no node for virtual ip %s", dstIP)
 }
 
 // peerAddr 返回对端地址。
@@ -498,6 +621,11 @@ func (d *datapath) adoptHandshake(fh *inflight) error {
 	if err := p.OnHandshakeSuccess(s); err != nil {
 		return err
 	}
+	// Phase 1c 尚无真实打洞:握手在 UDP 上完成即意味着双方已直接可达,
+	// 因此立即推进到 Direct。真实打洞属 Phase 2。
+	if err := p.OnPunchSuccess(); err != nil {
+		return err
+	}
 
 	// 清理进行中握手。
 	d.hsMu.Lock()
@@ -509,6 +637,12 @@ func (d *datapath) adoptHandshake(fh *inflight) error {
 	}
 	d.hsMu.Unlock()
 	fh.hs.Close()
+
+	// 新邻居加入:登记到探测器,并立即泛洪本节点 LSA,使全网尽快感知新链路。
+	if d.prober != nil {
+		d.prober.Register(peerID)
+	}
+	d.broadcastSelfLSA()
 
 	d.log.Info("handshake complete",
 		zap.String("peer_id", crypto.NodeIDString(peerID)),
@@ -622,6 +756,15 @@ func (d *datapath) dispatch(pkt *packet.ZCPacket, from net.Addr) error {
 	case packet.TypeData:
 		return d.handleData(pkt, from)
 
+	case packet.TypeLSA:
+		return d.handleLSAPacket(pkt)
+
+	case packet.TypeProbe:
+		d.handleProbe(from, pkt)
+
+	case packet.TypeProbeAck:
+		d.handleProbeAck(from, pkt)
+
 	case packet.TypeKeepalive:
 		d.handleKeepalive(pkt)
 
@@ -629,7 +772,7 @@ func (d *datapath) dispatch(pkt *packet.ZCPacket, from net.Addr) error {
 		d.handleClose(pkt)
 
 	default:
-		// 其它类型(LSA/Punch/Relay/Probe)属于后续阶段。
+		// 其它类型(Punch/Relay)属于后续阶段。
 		d.log.Debug("ignore packet type",
 			zap.String("type", packet.TypeName(pkt.Type())),
 			zap.String("from", from.String()))
@@ -637,20 +780,30 @@ func (d *datapath) dispatch(pkt *packet.ZCPacket, from net.Addr) error {
 	return nil
 }
 
-// handleData 解密并交付一个数据包。
+// handleLSAPacket 解密并处理一条 LSA 包。
+func (d *datapath) handleLSAPacket(pkt *packet.ZCPacket) error {
+	srcID := toNodeID(pkt.SrcNodeID())
+	plaintext, _, err := d.decryptControl(pkt)
+	if err != nil {
+		return fmt.Errorf("node: lsa decrypt: %w", err)
+	}
+	return d.handleLSA(srcID, plaintext)
+}
+
+// handleData 处理一个数据包:目的为本节点则解密交付,否则逐跳转发。
 func (d *datapath) handleData(pkt *packet.ZCPacket, from net.Addr) error {
 	sid := pkt.SessionID()
+	srcID := toNodeID(pkt.SrcNodeID())
+	dstID := toNodeID(pkt.DstNodeID())
+
 	s, ok := d.sessions.Get(sid)
 	if !ok {
 		return fmt.Errorf("no session %d", sid)
 	}
 
-	srcID := toNodeID(pkt.SrcNodeID())
-	dstID := toNodeID(pkt.DstNodeID())
-
-	// 目的地址不是本节点:Phase 1a 尚不转发,直接丢弃。
+	// 目的不是本节点:作为中间节点转发(Phase 1c 的透明多跳)。
 	if dstID != d.localID {
-		return fmt.Errorf("packet addressed to %s, not us", crypto.NodeIDString(dstID))
+		return d.forwardTransit(sid, pkt.Sequence(), srcID, dstID, pkt.Payload())
 	}
 
 	aad := buildAAD(srcID, dstID, sid)
@@ -694,6 +847,22 @@ func (d *datapath) handleClose(pkt *packet.ZCPacket) {
 	}
 	d.sessions.RemoveByPeer(srcID)
 	d.peers.Remove(srcID)
+}
+
+// dstIPv4 从 IPv4 包头解析目的地址。
+//
+// 只处理 IPv4(version=4):读取 IHL 计算头长,目的地址位于偏移 16..20。
+func dstIPv4(pkt []byte) (netip.Addr, error) {
+	if len(pkt) < 20 {
+		return netip.Addr{}, fmt.Errorf("node: ip packet too short: %d", len(pkt))
+	}
+	version := pkt[0] >> 4
+	if version != 4 {
+		return netip.Addr{}, fmt.Errorf("node: not ipv4 (version %d)", version)
+	}
+	var b [4]byte
+	copy(b[:], pkt[16:20])
+	return netip.AddrFrom4(b), nil
 }
 
 // toNodeID 把 16 字节切片转为 NodeID 数组。长度不足时返回零值。

@@ -130,3 +130,91 @@ func TestTunPing(t *testing.T) {
 	require.NoError(t, err, "ping 应成功")
 	assert.Contains(t, string(out), "0% packet loss", "应无丢包")
 }
+
+// TestThreeNodeTunLinear 用真实 TUN 设备验证 A-B-C 直线拓扑的透明多跳:
+// A 与 C 不直连,A 经 B 中转到 C,ping 通。
+func TestThreeNodeTunLinear(t *testing.T) {
+	requireRoot(t)
+
+	if _, err := exec.LookPath("ip"); err != nil {
+		t.Skip("缺少 ip 命令(iproute2),跳过")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	keyA, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+	keyB, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+	keyC, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+
+	tunA, tunB, tunC := "meshlin0", "meshlin1", "meshlin2"
+	vipA, vipB, vipC := "10.126.126.1", "10.126.126.2", "10.126.126.3"
+
+	// B 为中枢。
+	cfgB := tunPingConfig(t, "b", "node-b", tunB)
+	cfgB.Routing.LSAFloodInterval = time.Second
+	nodeB, err := New(Options{Config: cfgB, Logger: zap.NewNop(), KeyPair: keyB})
+	require.NoError(t, err)
+	defer nodeB.Close()
+	require.NoError(t, nodeB.RuntimeStart(ctx))
+	require.Eventually(t, func() bool { return len(nodeB.Addrs()) == 1 },
+		5*time.Second, 10*time.Millisecond)
+	addrB := nodeB.Addrs()[0]
+
+	// A、C 都只连 B。
+	cfgA := tunPingConfig(t, "a", "node-a", tunA)
+	cfgA.Routing.LSAFloodInterval = time.Second
+	nodeA, err := New(Options{
+		Config: cfgA, Logger: zap.NewNop(), KeyPair: keyA,
+		Peers: []PeerSpec{{Addr: addrB, PublicKey: keyB.PublicKey}},
+	})
+	require.NoError(t, err)
+	defer nodeA.Close()
+	require.NoError(t, nodeA.RuntimeStart(ctx))
+
+	cfgC := tunPingConfig(t, "c", "node-c", tunC)
+	cfgC.Routing.LSAFloodInterval = time.Second
+	nodeC, err := New(Options{
+		Config: cfgC, Logger: zap.NewNop(), KeyPair: keyC,
+		Peers: []PeerSpec{{Addr: addrB, PublicKey: keyB.PublicKey}},
+	})
+	require.NoError(t, err)
+	defer nodeC.Close()
+	require.NoError(t, nodeC.RuntimeStart(ctx))
+
+	// 配置虚拟 IP。
+	namer := func(n *Node) string {
+		return n.Ingress().(interface{ DeviceName() string }).DeviceName()
+	}
+	nameA, nameB, nameC := namer(nodeA), namer(nodeB), namer(nodeC)
+	t.Cleanup(func() {
+		_ = ipCmd("link", "del", nameA)
+		_ = ipCmd("link", "del", nameB)
+		_ = ipCmd("link", "del", nameC)
+	})
+	for _, spec := range []struct{ name, vip string }{
+		{nameA, vipA}, {nameB, vipB}, {nameC, vipC},
+	} {
+		require.NoError(t, ipCmd("addr", "add", spec.vip+"/24", "dev", spec.name))
+		require.NoError(t, ipCmd("link", "set", spec.name, "up"))
+	}
+
+	// 等 B 与 A、C 握手完成。
+	require.Eventually(t, func() bool { return nodeB.Peers().Len() == 2 },
+		15*time.Second, 100*time.Millisecond, "B 应与 A、C 完成握手")
+
+	// 等 A 学到到 C 的 2 跳路由。
+	require.Eventually(t, func() bool {
+		e, ok := nodeA.dp.RouteTo(keyC.NodeID())
+		return ok && e.Hops == 2
+	}, 15*time.Second, 200*time.Millisecond, "A 应经 B 学到到 C 的路由")
+
+	// A ping C。
+	out, err := exec.Command("ping", "-c", "3", "-W", "3", vipC).CombinedOutput()
+	t.Logf("A -> C ping 输出:\n%s", out)
+	require.NoError(t, err, "A ping C 应成功")
+	assert.Contains(t, string(out), "0% packet loss", "应无丢包")
+}

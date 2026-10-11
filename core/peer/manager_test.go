@@ -2,12 +2,16 @@ package peer
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/LiStudioorg/limesh/core/crypto"
+	"github.com/LiStudioorg/limesh/core/session"
 )
 
 // TestManagerAddAndGet 覆盖注册、取回与替换语义。
@@ -330,4 +334,119 @@ func TestManagerConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// directPeer 构造一个处于 Direct 状态并持有会话的 Peer。
+func directPeer(t *testing.T, b byte) *Peer {
+	t.Helper()
+	p, _, _ := newTestPeer(t, b)
+	require.NoError(t, p.StartHandshake())
+	require.NoError(t, p.OnHandshakeSuccess(nil))
+	require.NoError(t, p.OnPunchSuccess())
+	return p
+}
+
+// TestBroadcastSendsToActivePeers 验证 Broadcast 只发给活跃且持会话的对端。
+func TestBroadcastSendsToActivePeers(t *testing.T) {
+	m := NewManager(ManagerOptions{})
+	defer m.Close()
+
+	active1 := directPeer(t, 1)
+	active2 := directPeer(t, 2)
+	idle, _, _ := newTestPeer(t, 3)
+
+	// 给活跃 Peer 设置会话。
+	s1, err := session.NewSession(1, [32]byte{1}, [32]byte{2})
+	require.NoError(t, err)
+	active1.SetSession(s1)
+	s2, err := session.NewSession(2, [32]byte{1}, [32]byte{2})
+	require.NoError(t, err)
+	active2.SetSession(s2)
+
+	for _, p := range []*Peer{active1, active2, idle} {
+		_, err := m.Add(p)
+		require.NoError(t, err)
+	}
+
+	var got [][crypto.NodeIDSize]byte
+	sent := m.Broadcast([]byte("lsa"), func(id [crypto.NodeIDSize]byte, payload []byte) error {
+		got = append(got, id)
+		assert.Equal(t, "lsa", string(payload))
+		return nil
+	})
+	assert.Equal(t, 2, sent, "只应发给两个活跃且持会话的 Peer")
+	assert.Len(t, got, 2)
+}
+
+// TestBroadcastExceptSkipsGivenPeer 验证 BroadcastExcept 跳过指定对端。
+func TestBroadcastExceptSkipsGivenPeer(t *testing.T) {
+	m := NewManager(ManagerOptions{})
+	defer m.Close()
+
+	active1 := directPeer(t, 1)
+	active2 := directPeer(t, 2)
+	for _, p := range []*Peer{active1, active2} {
+		s, err := session.NewSession(1, [32]byte{1}, [32]byte{2})
+		require.NoError(t, err)
+		p.SetSession(s)
+		_, err = m.Add(p)
+		require.NoError(t, err)
+	}
+
+	var got [][crypto.NodeIDSize]byte
+	sent := m.BroadcastExcept(active1.NodeID, []byte("lsa"),
+		func(id [crypto.NodeIDSize]byte, payload []byte) error {
+			got = append(got, id)
+			return nil
+		})
+	assert.Equal(t, 1, sent)
+	require.Len(t, got, 1)
+	assert.Equal(t, active2.NodeID, got[0])
+}
+
+// TestBroadcastNilSender 验证 nil 发送函数安全返回 0。
+func TestBroadcastNilSender(t *testing.T) {
+	m := NewManager(ManagerOptions{})
+	defer m.Close()
+	assert.Equal(t, 0, m.Broadcast([]byte("x"), nil))
+}
+
+// TestBroadcastSenderErrorTolerated 验证单个发送失败不影响其余对端。
+func TestBroadcastSenderErrorTolerated(t *testing.T) {
+	m := NewManager(ManagerOptions{})
+	defer m.Close()
+
+	for i := byte(1); i <= 3; i++ {
+		p := directPeer(t, i)
+		s, err := session.NewSession(uint32(i), [32]byte{1}, [32]byte{2})
+		require.NoError(t, err)
+		p.SetSession(s)
+		_, err = m.Add(p)
+		require.NoError(t, err)
+	}
+
+	count := 0
+	sent := m.Broadcast([]byte("x"), func(id [crypto.NodeIDSize]byte, payload []byte) error {
+		count++
+		if count == 1 {
+			return errors.New("send failed")
+		}
+		return nil
+	})
+	assert.Equal(t, 2, sent, "失败一个仍应成功两个")
+}
+
+// TestBroadcastNoSessionSkipped 验证无会话的 Direct Peer 被跳过。
+func TestBroadcastNoSessionSkipped(t *testing.T) {
+	m := NewManager(ManagerOptions{})
+	defer m.Close()
+
+	p := directPeer(t, 1) // Direct 但无会话
+	_, err := m.Add(p)
+	require.NoError(t, err)
+
+	sent := m.Broadcast([]byte("x"), func(id [crypto.NodeIDSize]byte, payload []byte) error {
+		return nil
+	})
+	assert.Equal(t, 0, sent)
 }
