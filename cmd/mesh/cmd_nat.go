@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/LiStudioorg/limesh/core/api"
 )
 
 // newNATCmd 构造 nat 子命令组。
@@ -43,7 +45,11 @@ func runNATShow(cmd *cobra.Command, configPaths []string) error {
 	if outputJSON {
 		return printJSON(cmd.OutOrStdout(), info)
 	}
+	return printNATSnapshot(cmd, info)
+}
 
+// printNATSnapshot 以人类可读格式输出 NAT 观测快照。
+func printNATSnapshot(cmd *cobra.Command, info *api.NATSnapshot) error {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "NAT Type:     %s\n", natTypeLabel(info.Type))
 	if info.Mapped != "" {
@@ -105,20 +111,38 @@ func newNATCandidatesCmd(configPaths *[]string) *cobra.Command {
 
 // newNATProbeCmd 构造 `nat probe`。
 //
-// 注意:探测在**节点进程内**同步执行,CLI 只触发并通过 API 读取结果。
-// 当前 API 未提供"强制重探"端点,因此该命令通过读取现有观测结果实现,
-// 并在无结果时提示用户等待下一次周期刷新。
+// 与 `mesh nat` 的区别:`mesh nat` 读缓存,不触发探测;本命令通过
+// `POST /api/v1/nat/probe` 强制节点同步重探并等待结果。
 func newNATProbeCmd(configPaths *[]string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "probe",
-		Short: "重新读取 NAT 探测结果",
-		Long: `读取节点最近一次 NAT 探测结果。
+		Short: "强制重新探测 NAT(同步等待)",
+		Long: `强制节点立即重新执行一次 NAT 探测并同步等待结果。
 
-说明:实际探测由节点进程周期执行;本命令触发一次结果读取。
-强制立即重探(不需等待周期)属后续阶段,届时会增加 API 写端点。`,
+服务端会阻塞直到探测完成(最长 10 秒);若已有探测在进行,返回 409。`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runNATShow(cmd, *configPaths)
+			cl, err := newAdminClient(cmd, *configPaths)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := withTimeout()
+			defer cancel()
+
+			out := cmd.OutOrStdout()
+			if !outputJSON {
+				fmt.Fprintln(out, "Probing NAT type...")
+			}
+
+			info, err := cl.ProbeNAT(ctx)
+			if err != nil {
+				return err
+			}
+
+			if outputJSON {
+				return printJSON(out, info)
+			}
+			return printNATSnapshot(cmd, info)
 		},
 	}
 	addAdminFlags(cmd)

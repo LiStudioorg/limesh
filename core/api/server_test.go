@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +29,10 @@ type mockNode struct {
 	routes   []RouteSnapshot
 	topology TopologySnapshot
 	cfg      *config.Config
+
+	mu         sync.Mutex
+	probeErr   error
+	probeCalls int
 }
 
 func (m *mockNode) Status() StatusSnapshot             { return m.status }
@@ -42,6 +48,15 @@ func (m *mockNode) Candidates() []CandidateSnapshot {
 		{Type: "host", Addr: "192.168.1.10:11010", Priority: 2130706431, Source: "eth0"},
 		{Type: "srflx", Addr: "203.0.113.5:45231", Priority: 16777215, Source: "stun:stun.l.google.com:19302"},
 	}
+}
+
+// probeErr / probeCalls 让测试控制 ProbeNAT 行为。
+func (m *mockNode) ProbeNAT(ctx context.Context) error {
+	m.mu.Lock()
+	m.probeCalls++
+	err := m.probeErr
+	m.mu.Unlock()
+	return err
 }
 
 // newMockNode 构造一个带样本数据的 mock。
@@ -487,4 +502,52 @@ func TestServerCandidatesMethodNotAllowed(t *testing.T) {
 	srv, _ := startTestServer(t, ServerOptions{})
 	assert.Equal(t, http.StatusMethodNotAllowed, doRequest(t, srv, http.MethodPost, "/api/v1/nat", "").Code)
 	assert.Equal(t, http.StatusMethodNotAllowed, doRequest(t, srv, http.MethodPost, "/api/v1/candidates", "").Code)
+}
+
+// TestServerNATProbe 验证 POST /api/v1/nat/probe 触发重探并返回结果。
+func TestServerNATProbe(t *testing.T) {
+	mock := newMockNode()
+	_, cl := startTestServer(t, ServerOptions{Node: mock})
+
+	info, err := cl.ProbeNAT(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "cone", info.Type)
+	assert.Equal(t, "203.0.113.5:45231", info.Mapped)
+
+	mock.mu.Lock()
+	calls := mock.probeCalls
+	mock.mu.Unlock()
+	assert.Equal(t, 1, calls, "应触发一次探测")
+}
+
+// TestServerNATProbeError 验证探测失败返回 500。
+func TestServerNATProbeError(t *testing.T) {
+	mock := newMockNode()
+	mock.probeErr = errors.New("stun unreachable")
+	srv, _ := startTestServer(t, ServerOptions{Node: mock})
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/nat/probe", "")
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, rec.Body.String(), "stun unreachable")
+}
+
+// TestServerNATProbeMethodNotAllowed 验证非 POST 被拒绝。
+func TestServerNATProbeMethodNotAllowed(t *testing.T) {
+	srv, _ := startTestServer(t, ServerOptions{})
+	assert.Equal(t, http.StatusMethodNotAllowed,
+		doRequest(t, srv, http.MethodGet, "/api/v1/nat/probe", "").Code)
+}
+
+// TestServerNATProbeConcurrentConflict 验证并发探测返回 409。
+func TestServerNATProbeConcurrentConflict(t *testing.T) {
+	mock := newMockNode()
+	srv, _ := startTestServer(t, ServerOptions{Node: mock})
+
+	// 手动占住 probeMu,模拟一次探测仍在进行。
+	srv.probeMu.Lock()
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/nat/probe", "")
+	assert.Equal(t, http.StatusConflict, rec.Code)
+
+	srv.probeMu.Unlock()
 }

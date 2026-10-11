@@ -199,6 +199,17 @@ func (c *Client) NAT(ctx context.Context) (*NATSnapshot, error) {
 	return &out, nil
 }
 
+// ProbeNAT 触发一次同步 NAT 重探,返回刷新后的观测结果。
+//
+// 服务端在重探进行中会返回 409;客户端原样把它包装为错误。
+func (c *Client) ProbeNAT(ctx context.Context) (*NATSnapshot, error) {
+	var out NATSnapshot
+	if err := c.post(ctx, "/api/v1/nat/probe", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Candidates 获取候选地址列表。
 func (c *Client) Candidates(ctx context.Context) ([]CandidateSnapshot, error) {
 	var out []CandidateSnapshot

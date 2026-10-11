@@ -63,6 +63,9 @@ type Server struct {
 	running bool
 	// actualAddr 是实际监听地址(Unix Socket 为路径,TCP 为 host:port)。
 	actualAddr string
+
+	// probeMu 保证同一时刻只有一次 NAT 重探在跑;tryLock 失败返回 409。
+	probeMu sync.Mutex
 }
 
 // ServerOptions 是构造 Server 的参数。
@@ -305,6 +308,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/config/validate", s.auth(s.handleConfigValidate))
 	mux.HandleFunc("/api/v1/version", s.auth(s.handleVersion))
 	mux.HandleFunc("/api/v1/nat", s.auth(s.handleNAT))
+	mux.HandleFunc("/api/v1/nat/probe", s.auth(s.handleNATProbe))
 	mux.HandleFunc("/api/v1/candidates", s.auth(s.handleCandidates))
 
 	return mux
@@ -552,6 +556,36 @@ func (s *Server) handleConfigValidate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNAT(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, s.node.NAT())
+}
+
+// natProbeTimeout 是单次同步 NAT 重探的最长等待时间。
+const natProbeTimeout = 10 * time.Second
+
+// handleNATProbe 处理 POST /api/v1/nat/probe:同步触发一次 NAT 重探。
+//
+// 并发保护:同一时刻只允许一次重探;正在进行时返回 409 Conflict,
+// 避免多个调用互相干扰(它们共享同一个 STUN socket)。
+func (s *Server) handleNATProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// tryLock:不等待,拿不到即视为"已在探测中"。
+	if !s.probeMu.TryLock() {
+		writeError(w, http.StatusConflict, "nat probe already in progress")
+		return
+	}
+	defer s.probeMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(r.Context(), natProbeTimeout)
+	defer cancel()
+
+	if err := s.node.ProbeNAT(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, s.node.NAT())

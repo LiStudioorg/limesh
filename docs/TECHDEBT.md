@@ -290,14 +290,11 @@ Phase 2d 引入第三台 STUN + 反向发包探测,补全细分并回填 `[nat]`
 
 ---
 
-## 14. `mesh nat probe` 尚未强制立即重探
+## 14. ✅ 已关闭:`mesh nat probe` 支持强制同步重探
 
-**现状**
+**现状(已解决)**
 
-实际探测由节点进程周期执行(默认 5 分钟,与 `detect_cache_ttl` 对齐);
-`mesh nat probe` 目前只读取最近一次结果,不触发节点立即重探,因为 API 尚无
-写端点。
-
-**建议方向**
-
-Phase 2b 为 Admin API 增加 `POST /api/v1/nat/probe`,由 CLI 触发节点同步重探。
+Admin API 新增 `POST /api/v1/nat/probe`(`core/api` server + `Client.ProbeNAT`),
+由 `mesh nat probe` 触发节点**同步**重探(服务端超时 10 秒,并发调用返回 409);
+`mesh nat` 仍只读缓存。详见 `core/api/server.go handleNATProbe` 与
+`core/node/nat.go ProbeNAT`。

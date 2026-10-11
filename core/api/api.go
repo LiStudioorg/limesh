@@ -10,6 +10,7 @@
 package api
 
 import (
+	"context"
 	"time"
 
 	"github.com/LiStudioorg/limesh/core/config"
@@ -34,6 +35,11 @@ type NodeInfo interface {
 	NAT() NATSnapshot
 	// Candidates 返回候选地址快照。
 	Candidates() []CandidateSnapshot
+	// ProbeNAT 同步执行一次 NAT 重探并刷新内部快照。
+	//
+	// 返回错误表示重探失败(如未启用 NAT、STUN 全部不可达)。实现应保证
+	// 同一时刻只允许一次探测,并发调用应快速失败。
+	ProbeNAT(ctx context.Context) error
 }
 
 // NATSnapshot 是 NAT 穿透观测的只读快照。

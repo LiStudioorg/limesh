@@ -150,13 +150,17 @@ func (n *Node) NATDetectedAt() time.Time {
 	return n.natDetected
 }
 
-// ProbeNAT 同步执行一次 NAT 探测并刷新候选,返回 NAT 类型。
+// ProbeNAT 同步执行一次 NAT 探测并刷新候选。
 //
-// 供 CLI `mesh nat probe` 与测试使用;节点运行时通常由 runNATLoop 周期调用。
-func (n *Node) ProbeNAT(ctx context.Context) (nat.NATType, error) {
+// 供 Admin API 的 `POST /api/v1/nat/probe`(即 CLI `mesh nat probe`)与测试
+// 使用;节点运行时通常由 runNATLoop 周期调用。
+//
+// 返回错误表示未启用 NAT 或重探未能获得任何可用结果;调用方随后可通过
+// NATType()/MappedAddr()/Candidates() 读取刷新后的快照。
+func (n *Node) ProbeNAT(ctx context.Context) error {
 	if n.natCollector == nil {
-		return nat.NATUnknown, fmt.Errorf("node: nat not enabled")
+		return fmt.Errorf("node: nat not enabled")
 	}
 	n.refreshNAT(ctx)
-	return n.NATType(), nil
+	return nil
 }

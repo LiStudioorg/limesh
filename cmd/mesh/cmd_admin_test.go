@@ -73,6 +73,8 @@ func (m *cliMockNode) Candidates() []api.CandidateSnapshot {
 	}
 }
 
+func (m *cliMockNode) ProbeNAT(ctx context.Context) error { return nil }
+
 // startMockAPI 启动一个基于 Unix Socket 的 mock Admin API,返回 socket 路径。
 func startMockAPI(t *testing.T) string {
 	t.Helper()
@@ -322,5 +324,15 @@ func TestNATProbeCommand(t *testing.T) {
 	sock := startMockAPI(t)
 	out, err := execute(t, "nat", "probe", "--socket", sock)
 	require.NoError(t, err)
+	assert.Contains(t, out, "Probing NAT type...", "probe 应提示正在探测")
 	assert.Contains(t, out, "NAT Type")
+	assert.Contains(t, out, "203.0.113.5:45231")
+}
+
+func TestNATProbeCommandJSON(t *testing.T) {
+	sock := startMockAPI(t)
+	out, err := execute(t, "nat", "probe", "--socket", sock, "--json")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "Probing", "--json 不应输出提示文本")
+	assert.Contains(t, out, "\"type\": \"cone\"")
 }

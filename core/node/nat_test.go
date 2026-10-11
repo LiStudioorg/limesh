@@ -101,9 +101,8 @@ func TestNodeProbeNAT(t *testing.T) {
 	require.NoError(t, err)
 	defer n.Close()
 
-	ntype, err := n.ProbeNAT(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, nat.NATCone, ntype)
+	require.NoError(t, n.ProbeNAT(context.Background()))
+	assert.Equal(t, nat.NATCone, n.NATType())
 
 	m := n.MappedAddr()
 	require.NotNil(t, m)
@@ -131,7 +130,7 @@ func TestNodeProbeNATNotEnabled(t *testing.T) {
 	require.NoError(t, err)
 	defer n.Close()
 
-	_, err = n.ProbeNAT(context.Background())
+	err = n.ProbeNAT(context.Background())
 	require.Error(t, err)
 }
 
