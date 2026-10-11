@@ -413,6 +413,11 @@ func toMap(c *Config) map[string]any {
 			"heartbeat":          c.Routing.Heartbeat.String(),
 			"stale_timeout":      c.Routing.StaleTimeout.String(),
 		},
+		"admin": map[string]any{
+			"enabled":    c.Admin.Enabled,
+			"listen":     c.Admin.Listen,
+			"token_file": c.Admin.TokenFile,
+		},
 	}
 }
 

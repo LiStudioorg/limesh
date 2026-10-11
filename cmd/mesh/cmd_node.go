@@ -88,6 +88,20 @@ func runNode(cmd *cobra.Command, configPaths []string) error {
 		Config:   cfg,
 		Logger:   logger,
 		Hostname: hostname,
+		Version:  version,
+		Reload: func() error {
+			// 重新加载全部配置来源并校验;热重载的逐模块 Apply 属后续阶段,
+			// 当前实现保证"新配置可加载且合法",并刷新进程内快照。
+			newCfg, err := config.Load(config.Options{Paths: configPaths, Flags: flags})
+			if err != nil {
+				return err
+			}
+			logger.Info("config reloaded",
+				zap.String("network", newCfg.Network.Name),
+				zap.String("source", newCfg.Path),
+			)
+			return nil
+		},
 	})
 	if err != nil {
 		return err

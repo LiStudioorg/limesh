@@ -14,6 +14,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/LiStudioorg/limesh/core/api"
 	"github.com/LiStudioorg/limesh/core/config"
 	"github.com/LiStudioorg/limesh/core/crypto"
 	"github.com/LiStudioorg/limesh/core/ingress"
@@ -72,6 +73,16 @@ type Node struct {
 	peerSpecs []PeerSpec
 	// ingress 是接入层(TUN)。为空时节点只做加密数据面,不接入 IP 包。
 	ingress ingress.Ingress
+	// startedAt 是节点启动时间,用于 uptime。
+	startedAt time.Time
+	// adminSrv 是 Admin API 服务端;未启用时为 nil。
+	adminSrv *api.Server
+	// skipAdmin 为真时跳过 API 启动(测试用途)。
+	skipAdmin bool
+	// version 是二进制版本(注入给 Admin API)。
+	version string
+	// reload 触发配置热重载(注入给 Admin API);可为 nil。
+	reload func() error
 }
 
 // Options 是构造 Node 的参数。
@@ -103,6 +114,12 @@ type Options struct {
 	// NoIngress 为真时跳过接入层构造,仅运行加密数据面(Phase 1a 行为)。
 	// 用于只需要握手/加密、不需要 IP 转发的场景(如现有 E2E 测试)。
 	NoIngress bool
+	// NoAdmin 为真时即使配置启用也跳过 Admin API(测试用途)。
+	NoAdmin bool
+	// Version 是二进制版本,用于 Admin API 的 /version 端点。
+	Version string
+	// Reload 触发配置热重载;为空时 Admin API 的 reload 端点返回 501。
+	Reload func() error
 }
 
 // New 按配置装配一个节点。
@@ -127,6 +144,10 @@ func New(opts Options) (*Node, error) {
 		Hostname:  opts.Config.HostnameOr(opts.Hostname),
 		keyPair:   opts.KeyPair,
 		peerSpecs: append([]PeerSpec(nil), opts.Peers...),
+		startedAt: time.Now(),
+		skipAdmin: opts.NoAdmin,
+		version:   opts.Version,
+		reload:    opts.Reload,
 	}
 
 	// 接入层:优先使用注入的实现;否则按配置构造(可用 NoIngress 跳过)。
@@ -273,6 +294,9 @@ func (n *Node) Run(ctx context.Context) error {
 	// 接入层 → 数据面的转发循环:把 TUN 上读到的 IP 包加密后发给对端。
 	fwdDone := n.startIngressForwarding(ctx)
 
+	// 启动 Admin API(若配置启用且未被测试禁用)。
+	adminDone := n.startAdminAPI(ctx)
+
 	ingressMode := ""
 	if n.ingress != nil {
 		ingressMode = string(n.ingress.Mode())
@@ -299,7 +323,13 @@ func (n *Node) Run(ctx context.Context) error {
 		zap.String("reason", context.Cause(ctx).Error()),
 	)
 
-	// 先停转发循环(它读 ingress.Outbound),再停数据面,最后关监听器。
+	// 关闭顺序:Admin API → 转发循环 → 数据面 → 监听器。
+	if n.adminSrv != nil {
+		_ = n.adminSrv.Close()
+	}
+	if adminDone != nil {
+		<-adminDone
+	}
 	if fwdDone != nil {
 		<-fwdDone
 	}
@@ -311,6 +341,50 @@ func (n *Node) Run(ctx context.Context) error {
 		return fmt.Errorf("node: run: shutdown: %w", err)
 	}
 	return nil
+}
+
+// startAdminAPI 按配置启动 Admin API 服务端,返回其结束信号。
+//
+// 未启用、被测试禁用或构造失败时返回 nil;构造失败不阻断节点启动
+// (管理接口不可用不应导致数据面不可用),但会记录警告。
+func (n *Node) startAdminAPI(ctx context.Context) <-chan struct{} {
+	if !n.cfg.Admin.Enabled || n.skipAdmin {
+		return nil
+	}
+
+	srv, err := api.NewServer(api.ServerOptions{
+		Config:  n.cfg,
+		Node:    n,
+		Logger:  n.log,
+		Version: n.version,
+		Reload:  n.reload,
+	})
+	if err != nil {
+		n.log.Warn("admin api disabled: construct failed", zap.Error(err))
+		return nil
+	}
+	if err := srv.Listen(); err != nil {
+		n.log.Warn("admin api disabled: listen failed", zap.Error(err))
+		return nil
+	}
+	n.adminSrv = srv
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := srv.Serve(ctx); err != nil {
+			n.log.Warn("admin api serve error", zap.Error(err))
+		}
+	}()
+	return done
+}
+
+// AdminAddr 返回 Admin API 的实际监听地址;未启用时为空。
+func (n *Node) AdminAddr() string {
+	if n.adminSrv == nil {
+		return ""
+	}
+	return n.adminSrv.Addr()
 }
 
 // startIngressForwarding 启动"TUN → 数据面"的转发循环。

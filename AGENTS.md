@@ -1031,6 +1031,45 @@ mesh version       # 版本
 - **`controller` 不参与数据面**。控制面挂了只影响新节点加入与配置变更,已建立的 P2P 连接继续工作。这是去中心化设计的重要性质:控制面不是单点故障。
 - **`gateway` 与 `exit` 的区别**:`gateway` 是把虚拟网络暴露给物理网络(入方向),`exit` 是把物理网络暴露给虚拟网络(出方向)。
 
+### 11.1 Admin API(Phase 1d)
+
+运行时管理接口,由 `core/api` 提供,`mesh status` / `peer` / `route` / `topo` /
+`config` 等 CLI 命令通过它查询运行中的节点。所有角色共享同一实现。
+
+**传输**:
+
+- Unix Socket(默认,Linux/macOS):`unix:///var/run/mesh/admin.sock`,权限 `0600`,
+  天然仅本机可达,无需 token。
+- TCP + token(Windows 默认,或显式配置):`tcp://127.0.0.1:9090`,强制
+  `Authorization: Bearer <token>`,token 存于 `token_file`(0600)。
+
+**配置**(`[admin]` 段):
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `admin.enabled` | `false` | 是否启用 |
+| `admin.listen` | 平台默认 | `unix://<path>` 或 `tcp://<host:port>`;留空用平台默认 |
+| `admin.token_file` | `/var/lib/mesh/admin.token` | TCP 模式的 token 文件 |
+
+**REST 端点**(统一 JSON):
+
+```
+GET  /api/v1/status              节点状态
+GET  /api/v1/peers               对端列表
+GET  /api/v1/peers/{nodeID}      单个对端(支持前缀匹配)
+GET  /api/v1/routes              路由表
+GET  /api/v1/topology            拓扑(节点 + 链路)
+GET  /api/v1/config              脱敏后的配置(secret 不出现明文)
+GET  /api/v1/config/raw          原始配置文件内容
+GET  /api/v1/config/sources      字段来源追踪
+GET  /api/v1/version             版本
+POST /api/v1/config/reload       触发热重载
+POST /api/v1/config/validate     校验运行配置
+```
+
+> ⚠️ Phase 1d 的 `config sources` 返回**最佳努力**结果(文件来源已知,
+> 其余归为 default),因为配置系统尚未逐字段记录来源;见 `docs/TECHDEBT.md`。
+
 ---
 
 ## 12. 三种 Ingress 模式

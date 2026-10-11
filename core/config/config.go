@@ -170,6 +170,8 @@ type Config struct {
 	TUN TUNConfig `koanf:"tun"`
 	// Routing 是路由与路径选择配置。
 	Routing RoutingConfig `koanf:"routing"`
+	// Admin 是 Admin API 配置。
+	Admin AdminConfig `koanf:"admin"`
 	// Path 记录配置来源文件,供排错与来源追踪使用,不参与序列化。
 	Path string `koanf:"-"`
 }
@@ -275,6 +277,31 @@ type LogConfig struct {
 	Format string `koanf:"format"`
 }
 
+// AdminConfig 描述 Admin API 配置。
+//
+// 监听方式:默认走 Unix Socket(权限 0600,仅本机);Windows 无 Unix Socket,
+// 退化为 TCP + token。也可显式配置为 tcp:// 以便远程管理(必须配合 token)。
+type AdminConfig struct {
+	// Enabled 表示是否启用 Admin API。
+	Enabled bool `koanf:"enabled"`
+	// Listen 是监听地址,格式 unix://<path> 或 tcp://<host:port>。
+	// 留空时使用平台默认值(见 DefaultAdminListen)。
+	Listen string `koanf:"listen"`
+	// TokenFile 是 TCP 模式下的认证 token 文件路径。
+	// 文件内容为 token 明文,权限应设为 0600。
+	TokenFile string `koanf:"token_file"`
+}
+
+// 默认 Admin API 服务地址常量。
+const (
+	// DefaultAdminUnixSocket 是 Linux/macOS 默认 Unix Socket 路径。
+	DefaultAdminUnixSocket = "/var/run/mesh/admin.sock"
+	// DefaultAdminTCPListen 是 Windows 或远程管理的默认 TCP 地址。
+	DefaultAdminTCPListen = "127.0.0.1:9090"
+	// DefaultAdminTokenFile 是默认 token 文件路径。
+	DefaultAdminTokenFile = "/var/lib/mesh/admin.token"
+)
+
 // Default 返回内置默认值构成的配置。
 //
 // 默认值是优先级链的最低层;任何来源都可以覆盖它。
@@ -322,7 +349,25 @@ func Default() *Config {
 			Heartbeat:        DefaultHeartbeat,
 			StaleTimeout:     DefaultStaleTimeout,
 		},
+		Admin: AdminConfig{
+			Enabled:   false,
+			Listen:    "", // 留空 -> 平台默认
+			TokenFile: DefaultAdminTokenFile,
+		},
 	}
+}
+
+// EffectiveAdminListen 返回最终生效的 Admin 监听地址。
+//
+// 优先级:显式 listen > 平台默认(Windows 用 TCP,其余用 Unix Socket)。
+func (c *Config) EffectiveAdminListen() string {
+	if c == nil {
+		return ""
+	}
+	if c.Admin.Listen != "" {
+		return c.Admin.Listen
+	}
+	return DefaultAdminListen()
 }
 
 // Validate 校验配置的合法性与一致性。
@@ -384,7 +429,40 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: validate: routing: %w", err)
 	}
 
+	if err := c.Admin.validate(); err != nil {
+		return fmt.Errorf("config: validate: admin: %w", err)
+	}
+
 	return nil
+}
+
+// validate 校验 [admin] 段。
+func (a AdminConfig) validate() error {
+	if a.Listen == "" {
+		return nil
+	}
+	scheme, addr := splitAdminListen(a.Listen)
+	switch scheme {
+	case "unix":
+		if addr == "" {
+			return fmt.Errorf("listen %q: unix path must not be empty", a.Listen)
+		}
+	case "tcp":
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return fmt.Errorf("listen %q: %w", a.Listen, err)
+		}
+	default:
+		return fmt.Errorf("listen %q: unsupported scheme %q (want unix:// or tcp://)", a.Listen, scheme)
+	}
+	return nil
+}
+
+// splitAdminListen 拆分 admin 监听地址为 scheme 与剩余部分。
+func splitAdminListen(s string) (scheme, addr string) {
+	if i := strings.Index(s, "://"); i >= 0 {
+		return s[:i], s[i+3:]
+	}
+	return "", s
 }
 
 // validate 校验 [routing] 段的取值范围(docs/CONFIG.md 6.7)。

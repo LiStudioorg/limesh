@@ -1,10 +1,14 @@
 package node
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/LiStudioorg/limesh/core/crypto"
 	"github.com/LiStudioorg/limesh/core/packet"
@@ -188,4 +192,116 @@ func TestRecomputeRoutesAtomic(t *testing.T) {
 	assert.Equal(t, uint8(1), e.Hops)
 	assert.NotNil(t, dp.RouteTable())
 	assert.NotNil(t, dp.Topology())
+}
+
+// TestAdminSnapshotMethods 验证 Node 的 api.NodeInfo 快照转换。
+func TestAdminSnapshotMethods(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+
+	cfg := testConfig(t)
+	n, err := New(Options{Config: cfg, Logger: zap.NewNop(), KeyPair: kp, NoIngress: true, NoAdmin: true, Version: "vtest"})
+	require.NoError(t, err)
+	defer n.Close()
+
+	// Status 基本字段。
+	st := n.Status()
+	assert.Equal(t, kp.NodeIDHex(), st.NodeID)
+	assert.Equal(t, "vtest", st.Version)
+	assert.NotEmpty(t, st.VirtualIP)
+
+	// 空快照应返回非 nil 切片。
+	assert.NotNil(t, n.PeerList())
+	assert.NotNil(t, n.RouteList())
+	topo := n.TopologySnapshot()
+	assert.NotNil(t, topo.Nodes)
+	assert.NotNil(t, topo.Edges)
+}
+
+// TestAdminSnapshotWithRoute 验证路由快照包含已计算条目。
+func TestAdminSnapshotWithRoute(t *testing.T) {
+	dp, self := routedTestDatapath(t)
+
+	peerID := [crypto.NodeIDSize]byte{6, 6}
+	selfLSA := route.NewLSA(self)
+	selfLSA.SeqNo = 1
+	selfLSA.AddNeighbor(peerID, 10)
+	dp.topology.Update(selfLSA)
+	peerLSA := route.NewLSA(peerID)
+	peerLSA.SeqNo = 1
+	peerLSA.AddNeighbor(self, 10)
+	dp.topology.Update(peerLSA)
+	dp.recomputeRoutes()
+
+	// 构造一个 Node 包装该数据面以测试快照方法。
+	n := &Node{dp: dp, startedAt: time.Now(), Hostname: "x", version: "v"}
+	routes := n.RouteList()
+	require.Len(t, routes, 2)
+	topo := n.TopologySnapshot()
+	assert.Len(t, topo.Nodes, 2)
+	assert.Len(t, topo.Edges, 2)
+}
+
+// TestAdminStartDisabled 验证未启用时 Admin API 不启动。
+func TestAdminStartDisabled(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+	cfg := testConfig(t)
+	n, err := New(Options{Config: cfg, Logger: zap.NewNop(), KeyPair: kp, NoIngress: true})
+	require.NoError(t, err)
+	defer n.Close()
+
+	// 默认 admin.enabled=false。
+	assert.Nil(t, n.startAdminAPI(context.Background()))
+	assert.Empty(t, n.AdminAddr())
+}
+
+// TestAdminStartEnabled 验证启用时 API 监听并可在停止后清理。
+func TestAdminStartEnabled(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "admin.sock")
+
+	kp, err := crypto.GenerateKeyPair()
+	require.NoError(t, err)
+	cfg := testConfig(t)
+	cfg.Admin.Enabled = true
+	cfg.Admin.Listen = "unix://" + sock
+
+	n, err := New(Options{Config: cfg, Logger: zap.NewNop(), KeyPair: kp, NoIngress: true, Version: "v1"})
+	require.NoError(t, err)
+	defer n.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := n.startAdminAPI(ctx)
+	require.NotNil(t, done)
+	require.Eventually(t, func() bool { return n.AdminAddr() != "" }, 2*time.Second, 10*time.Millisecond)
+	assert.Equal(t, sock, n.AdminAddr())
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admin server 未在取消后退出")
+	}
+}
+
+// TestPeerListWithData 验证 PeerList 快照包含对端。
+func TestPeerListWithData(t *testing.T) {
+	dp, _, _ := newTestDatapath(t)
+	peerID := [crypto.NodeIDSize]byte{3, 4, 5}
+	p, err := dp.peers.GetOrCreate(peerID, "127.0.0.1:9999")
+	require.NoError(t, err)
+	require.NoError(t, p.StartHandshake())
+	require.NoError(t, p.OnHandshakeSuccess(nil))
+	require.NoError(t, p.OnPunchSuccess())
+
+	n := &Node{dp: dp, startedAt: time.Now(), Hostname: "h"}
+	peers := n.PeerList()
+	require.Len(t, peers, 1)
+	assert.Equal(t, crypto.NodeIDString(peerID), peers[0].NodeID)
+	assert.Equal(t, "direct", peers[0].State)
+
+	st := n.Status()
+	assert.Equal(t, 1, st.PeerCount)
+	assert.Equal(t, 1, st.DirectPeers)
 }

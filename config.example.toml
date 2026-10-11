@@ -95,6 +95,24 @@ heartbeat          = "5s"
 stale_timeout      = "20s"
 
 # ---------------------------------------------------------------------------
+# Admin API
+# ---------------------------------------------------------------------------
+# 供 `mesh status` / `mesh peer list` / `mesh route list` / `mesh topo` /
+# `mesh config reload` 等命令使用。
+
+[admin]
+# 是否启用 Admin API。
+enabled = true
+
+# 监听地址:unix://<path> 或 tcp://<host:port>。
+# 留空则用平台默认:Linux/macOS=unix:///var/run/mesh/admin.sock
+#                  Windows=tcp://127.0.0.1:9090(自动启用 token)
+listen = ""
+
+# TCP 模式下的认证 token 文件路径(内容为 token 明文,权限 0600)。
+token_file = "/var/lib/mesh/admin.token"
+
+# ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 

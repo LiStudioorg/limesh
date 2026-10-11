@@ -582,22 +582,33 @@ mesh node --network prod --secret "$MESH_SECRET" --exit-node <exit-node-id>
 
 ### 工具
 
+> **当前进度(Phase 1d)**:以下查询类命令已可用 —— `status`、`peer list`、
+> `peer show`、`route list`、`topo`、`config show/raw/sources/validate/diff/
+> export/expand/reload`。它们通过 **Admin API** 查询运行中的节点,需要在配置中
+> 启用 `[admin].enabled = true`。
+>
+> 标注为后续阶段的命令(`peer add/remove/reconnect`、`route trace`、
+> `status --wait` 等)尚未实现。
+
+所有查询命令都支持通用 flag:`--socket <path>`(覆盖 Admin Socket)、
+`--token <token>`(TCP 模式)、`--json`、`--no-color`。
+
 #### `mesh status` — 状态
 
 ```bash
 mesh status
 mesh status --json
-mesh status --wait 10s        # 等待网络就绪,用于脚本
 ```
 
-```bash
-mesh status --json | jq .peers
 ```
-
-```json
-[
-  { "node_id": "5c1d8f2ab9034e77", "virtual_ip": "10.126.126.87", "path": "direct", "rtt_ms": 8.4 }
-]
+Node ID:    a1b2c3d4e5f60718
+Hostname:   node-a
+Virtual IP: 10.126.126.1
+Uptime:     2h35m
+Peers:      2 (1 direct, 1 relayed)
+Routes:     3
+Ingress:    tun
+Version:    v0.1.0
 ```
 
 #### `mesh peer` — 对端管理
@@ -605,9 +616,12 @@ mesh status --json | jq .peers
 ```bash
 mesh peer list                          # 列出对端
 mesh peer show 5c1d8f2ab9034e77         # 查看单个对端详情
-mesh peer add 9.9.9.9:11010             # 手动添加静态对端
-mesh peer remove 9.9.9.9:11010          # 删除静态对端
-mesh peer reconnect 5c1d8f2ab9034e77    # 强制重连(触发重新打洞)
+```
+
+```
+NODE ID       VIRTUAL IP    STATE    RTT     LOSS  ADDR
+112233445566  10.126.126.2  direct   2.1ms   0.0%  10.0.0.5:11010
+99aabbccddee  10.126.126.3  relayed  45.3ms  0.2%  10.0.0.9:11010
 ```
 
 ```bash
@@ -634,10 +648,9 @@ mesh route list
 ```
 
 ```
-DESTINATION         NEXT HOP           METRIC   HOPS   PATH
-10.126.126.87/32    10.126.126.87      8        1      direct
-10.126.126.63/32    1.2.3.4:11010      34       2      relayed
-192.168.1.0/24      10.126.126.19      12       2      direct
+DESTINATION   NEXT HOP      COST  HOPS
+10.126.126.2  112233445566  12    1
+10.126.126.3  112233445566  22    2
 ```
 
 ```bash
@@ -645,10 +658,7 @@ mesh route trace 10.126.126.87
 ```
 
 ```
-traceroute to 10.126.126.87 (virtual)
- 1  10.126.126.42 (self)      0.1ms
- 2  10.126.126.87             8.4ms
-path: direct (udp)
+(后续阶段实现:traceroute 需要逐跳探测)
 ```
 
 #### `mesh topo` — 拓扑
@@ -660,10 +670,12 @@ mesh topo --json | jq .
 ```
 
 ```
-node-b (10.126.126.42)
-├── node-c (10.126.126.87)     direct    rtt=8.4ms
-├── relay-a (1.2.3.4)          relayed   rtt=12.1ms
-└── 192.168.1.0/24             proxied via node-router
+a1b2c3d4e5f6  10.126.126.1 [self]
+  ├─ cost 12   ▼ 112233445566
+112233445566  10.126.126.2
+  ├─ cost 10   ▼ 99aabbccddee
+99aabbccddee  10.126.126.3
+  ├─ cost 10   ▼ 112233445566
 ```
 
 #### `mesh config` — 配置管理

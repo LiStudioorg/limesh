@@ -199,3 +199,52 @@ Phase 2/5 引入源路由或逐跳密钥协商:源节点与目的节点建立端
 
 Phase 5 的 weighted/latency 策略完善时,把丢包率纳入 LSA Cost:
 `cost = hop_cost + RTT_ms + loss_rate × 1000`(AGENTS.md 8.6)。
+
+---
+
+## 9. Admin API 配置来源追踪为最佳努力
+
+**现状**
+
+`GET /api/v1/config/sources` 与 `mesh config sources` 只能确定"来自文件"
+或"来自默认值",无法区分详细层级(cli-block / env / cli / 具体行号),
+因为 `core/config` 尚未逐字段记录来源(`loader.go` 合并后只保留最终值)。
+
+**影响**
+
+排错时无法精确回答"这个字段为什么是这个值"——这正是 AGENTS.md §10.7
+要求的能力。
+
+**建议方向**
+
+在 `config.Load` 中为每个字段记录来源(koanf 支持来源追踪,或合并时旁挂
+一张 `map[path]source`)。这是一次需要改动配置加载核心的工作,建议在
+Phase 1e/2 单独安排。
+
+---
+
+## 10. Admin API 未来可评估 gRPC
+
+**现状**
+
+Admin API 基于 HTTP + JSON(`core/api`)。CLI 与 API 共享 `core/api` 的
+快照类型,类型安全由 Go 侧保证,但跨语言/跨进程契约是松散的 JSON。
+
+**建议方向**
+
+Phase 5 评估引入 gRPC(protobuf):性能更好、契约强类型、便于 Web 面板与
+第三方集成。当前不引入以保持依赖最小(AGENTS.md 7.1 纯 Go 优先)。
+
+---
+
+## 11. `mesh config diff` 尚未与运行中节点对比
+
+**现状**
+
+`mesh config diff` 目前只输出文件层加载结果,未与运行中节点的生效配置做
+真实差异对比(需要把运行配置通过 API 拉回并与文件合并结果逐字段比较)。
+
+**建议方向**
+
+Phase 2 热重载完善后,基于 `admin` 的 `/config` 端点实现真实 diff,并标注
+每项的响应级别(hot / reconnect / restart)。

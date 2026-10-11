@@ -40,6 +40,11 @@ NAT、防火墙还是跨洲链路。单个二进制承载全部角色。
 
 	root.AddCommand(newNodeCmd(&configPaths))
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newStatusCmd(&configPaths))
+	root.AddCommand(newPeerCmd(&configPaths))
+	root.AddCommand(newRouteCmd(&configPaths))
+	root.AddCommand(newTopoCmd(&configPaths))
+	root.AddCommand(newConfigCmd(&configPaths))
 
 	return root
 }
