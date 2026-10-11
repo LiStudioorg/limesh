@@ -14,6 +14,7 @@ import (
 
 	"github.com/LiStudioorg/limesh/core/crypto"
 	"github.com/LiStudioorg/limesh/core/handshake"
+	"github.com/LiStudioorg/limesh/core/nat"
 	"github.com/LiStudioorg/limesh/core/packet"
 	"github.com/LiStudioorg/limesh/core/peer"
 	"github.com/LiStudioorg/limesh/core/route"
@@ -50,6 +51,8 @@ type inflight struct {
 	remote *net.UDPAddr
 	// startedAt 用于握手超时清理。
 	startedAt time.Time
+	// remoteCands 是从握手载荷中解出的对端候选地址(Phase 2a)。
+	remoteCands []nat.Candidate
 }
 
 // datapath 是节点的加密数据面。
@@ -105,6 +108,9 @@ type datapath struct {
 
 	// onRouteChange 在转发表重算后被调用,用于日志/测试观测,可为 nil。
 	onRouteChange func(*route.RouteTable)
+
+	// candidateProvider 返回本端候选地址,用于握手携带(Phase 2a)。可为 nil。
+	candidateProvider func() []nat.Candidate
 
 	closed   bool
 	closeMu  sync.Mutex
@@ -445,7 +451,15 @@ func (d *datapath) initiate(spec PeerSpec) error {
 		return fmt.Errorf("node: initiate %s: %w", spec.Addr, err)
 	}
 
-	msg, err := hs.WriteMessage()
+	// 把本端候选地址随 Init 消息携带(Phase 2a 的临时交换机制)。
+	var appPayload []byte
+	if d.candidateProvider != nil {
+		if cands := d.candidateProvider(); len(cands) > 0 {
+			appPayload = nat.EncodeCandidates(cands)
+		}
+	}
+
+	msg, err := hs.WriteMessageWithPayload(appPayload)
 	if err != nil {
 		return fmt.Errorf("node: initiate %s: write init: %w", spec.Addr, err)
 	}
@@ -522,16 +536,27 @@ func (d *datapath) handleInit(payload []byte, from net.Addr) error {
 	d.hsMu.Unlock()
 
 	// ReadMessage 校验 MAC1/时间戳并把对端公钥解出。
-	if _, err := fh.hs.ReadMessage(payload); err != nil {
+	appPayload, err := fh.hs.ReadMessage(payload)
+	if err != nil {
 		d.hsMu.Lock()
 		delete(d.inflight, key)
 		delete(d.byIndex, parsed.SenderIndex)
 		d.hsMu.Unlock()
 		return fmt.Errorf("node: read init from %s: %w", from, err)
 	}
+	// 从 Init 载荷解出对端候选地址。
+	if cands, derr := nat.DecodeCandidates(appPayload); derr == nil && len(cands) > 0 {
+		fh.remoteCands = cands
+	}
 
 	// 产出 Resp;这是 IK 的最后一条 Noise 消息,密钥在此派生。
-	resp, err := fh.hs.WriteMessage()
+	var respPayload []byte
+	if d.candidateProvider != nil {
+		if cands := d.candidateProvider(); len(cands) > 0 {
+			respPayload = nat.EncodeCandidates(cands)
+		}
+	}
+	resp, err := fh.hs.WriteMessageWithPayload(respPayload)
 	if err != nil {
 		return fmt.Errorf("node: write resp to %s: %w", from, err)
 	}
@@ -555,8 +580,13 @@ func (d *datapath) handleResp(payload []byte, from net.Addr) error {
 		return fmt.Errorf("node: handle resp from %s: no inflight handshake", from)
 	}
 
-	if _, err := fh.hs.ReadMessage(payload); err != nil {
+	appPayload, err := fh.hs.ReadMessage(payload)
+	if err != nil {
 		return fmt.Errorf("node: read resp from %s: %w", from, err)
+	}
+	// 从 Resp 载荷解出对端候选地址。
+	if cands, derr := nat.DecodeCandidates(appPayload); derr == nil && len(cands) > 0 {
+		fh.remoteCands = cands
 	}
 
 	// 产出应用层确认(第 3 条消息)。
@@ -613,6 +643,18 @@ func (d *datapath) adoptHandshake(fh *inflight) error {
 	}
 	p.SetAddr(fh.remote.String())
 	p.SetSession(s)
+
+	// Phase 2a:保存握手交换来的候选地址(仅存储,供 API/CLI 观测;
+	// 打洞消费属 Phase 2b)。
+	if len(fh.remoteCands) > 0 {
+		p.SetRemoteCandidates(fh.remoteCands)
+	}
+	if d.candidateProvider != nil {
+		if cands := d.candidateProvider(); len(cands) > 0 {
+			p.SetLocalCandidates(cands)
+		}
+	}
+
 	if p.State() == peer.StateIdle || p.State() == peer.StateDead || p.State() == peer.StateFailed {
 		if err := p.StartHandshake(); err != nil {
 			return err

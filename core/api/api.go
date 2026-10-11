@@ -30,6 +30,34 @@ type NodeInfo interface {
 	TopologySnapshot() TopologySnapshot
 	// Config 返回当前生效的配置快照。
 	Config() *config.Config
+	// NAT 返回 NAT 穿透观测快照。
+	NAT() NATSnapshot
+	// Candidates 返回候选地址快照。
+	Candidates() []CandidateSnapshot
+}
+
+// NATSnapshot 是 NAT 穿透观测的只读快照。
+type NATSnapshot struct {
+	// Type 是 NAT 类型:unknown / open / cone / symmetric。
+	Type string `json:"type"`
+	// Mapped 是公网映射地址(host:port);无结果时为空。
+	Mapped string `json:"mapped,omitempty"`
+	// DetectedAt 是最近一次探测时间;未探测时为零值。
+	DetectedAt time.Time `json:"detected_at,omitempty"`
+	// CandidateCount 是已收集的候选地址数量。
+	CandidateCount int `json:"candidate_count"`
+}
+
+// CandidateSnapshot 是单个候选地址的只读快照。
+type CandidateSnapshot struct {
+	// Type 是候选类型:host / srflx / relay。
+	Type string `json:"type"`
+	// Addr 是候选地址(host:port)。
+	Addr string `json:"addr"`
+	// Priority 是 ICE 风格优先级。
+	Priority uint32 `json:"priority"`
+	// Source 是来源:网卡名 / STUN 服务器。
+	Source string `json:"source,omitempty"`
 }
 
 // StatusSnapshot 是节点状态的只读快照。

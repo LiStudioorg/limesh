@@ -248,3 +248,56 @@ Phase 5 评估引入 gRPC(protobuf):性能更好、契约强类型、便于 Web 
 
 Phase 2 热重载完善后,基于 `admin` 的 `/config` 端点实现真实 diff,并标注
 每项的响应级别(hot / reconnect / restart)。
+
+---
+
+## 12. 候选地址交换借用握手载荷(临时机制)
+
+**现状**
+
+Phase 2a 把本端候选地址编码后附加在 Noise 握手的 Init/Resp 消息载荷中
+(`handshake.WriteMessageWithPayload` + `nat.EncodeCandidates`)。这是为了避免
+为候选交换单独引入一轮往返。
+
+**影响**
+
+- 候选列表受握手包体积约束(`nat.MaxCandidates = 16`);
+- 候选只在建连时交换一次,后续变化(NAT 重绑定)不会自动同步;
+- 握手层承担了它本不应知道的 L2 语义。
+
+**建议方向**
+
+Phase 2c 控制面落地后,候选地址改为由控制面/发现通道下发,握手只负责身份
+认证与密钥协商;`WriteMessageWithPayload` 的调用方从 datapath 中移除。
+
+---
+
+## 13. NAT 类型仅三级,未细分锥形
+
+**现状**
+
+`core/nat` 只区分 `open` / `cone` / `symmetric`(RFC 3489 简化)。完整的
+full-cone / restricted / port-restricted 细分需要第三方服务器反向探测。
+
+**影响**
+
+打洞策略(Phase 2b)只能据此做"锥形 vs 对称"的粗判断,对受限锥形的
+打洞成功率估计偏乐观。
+
+**建议方向**
+
+Phase 2d 引入第三台 STUN + 反向发包探测,补全细分并回填 `[nat]` 的策略开关。
+
+---
+
+## 14. `mesh nat probe` 尚未强制立即重探
+
+**现状**
+
+实际探测由节点进程周期执行(默认 5 分钟,与 `detect_cache_ttl` 对齐);
+`mesh nat probe` 目前只读取最近一次结果,不触发节点立即重探,因为 API 尚无
+写端点。
+
+**建议方向**
+
+Phase 2b 为 Admin API 增加 `POST /api/v1/nat/probe`,由 CLI 触发节点同步重探。

@@ -45,6 +45,7 @@ NAT、防火墙还是跨洲链路。单个二进制承载全部角色。
 	root.AddCommand(newRouteCmd(&configPaths))
 	root.AddCommand(newTopoCmd(&configPaths))
 	root.AddCommand(newConfigCmd(&configPaths))
+	root.AddCommand(newNATCmd(&configPaths))
 
 	return root
 }

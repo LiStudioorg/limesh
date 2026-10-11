@@ -418,7 +418,22 @@ func toMap(c *Config) map[string]any {
 			"listen":     c.Admin.Listen,
 			"token_file": c.Admin.TokenFile,
 		},
+		"nat": map[string]any{
+			"stun_servers":              strSliceAny(c.NAT.STUNServers),
+			"stun_timeout":              c.NAT.STUNTimeout.String(),
+			"detect_cache_ttl":          c.NAT.DetectCacheTTL.String(),
+			"candidate_skip_interfaces": strSliceAny(c.NAT.CandidateSkipInterfaces),
+		},
 	}
+}
+
+// strSliceAny 把字符串切片转为 koanf 可消费的 []any。
+func strSliceAny(in []string) []any {
+	out := make([]any, 0, len(in))
+	for _, s := range in {
+		out = append(out, s)
+	}
+	return out
 }
 
 // 以下导入在部分构建路径下由 koanf 间接使用,显式保留以便替换实现。

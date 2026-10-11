@@ -121,6 +121,8 @@ func testConfig(t *testing.T) *config.Config {
 	cfg.Network.Hostname = "node-a"
 	cfg.Listen = []config.ListenConfig{{Addr: "udp://127.0.0.1:0"}}
 	cfg.Peers = []string{}
+	// 测试不访问真实 STUN 服务器:清空列表使探测器不构造。
+	cfg.NAT.STUNServers = nil
 	require.NoError(t, cfg.Validate())
 	return cfg
 }

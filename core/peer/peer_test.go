@@ -2,6 +2,7 @@ package peer
 
 import (
 	"errors"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/LiStudioorg/limesh/core/crypto"
+	"github.com/LiStudioorg/limesh/core/nat"
 )
 
 // fakeClock 是手工推进的假时钟,使超时测试无需真实等待。
@@ -460,4 +462,36 @@ func TestTransitionString(t *testing.T) {
 func TestSystemClockNow(t *testing.T) {
 	c := SystemClock{}
 	assert.False(t, c.Now().IsZero())
+}
+
+// TestPeerCandidateStorage 验证候选地址的存取与副本语义。
+func TestPeerCandidateStorage(t *testing.T) {
+	p, _, _ := newTestPeer(t, 20)
+
+	// 初始为空。
+	assert.Nil(t, p.RemoteCandidates())
+	assert.Nil(t, p.LocalCandidates())
+
+	rem := []nat.Candidate{
+		{Type: nat.CandidateHost, Addr: netip.MustParseAddrPort("192.168.1.1:11010"), Priority: 100},
+		{Type: nat.CandidateSrflx, Addr: netip.MustParseAddrPort("203.0.113.1:40000"), Priority: 50},
+	}
+	p.SetRemoteCandidates(rem)
+
+	got := p.RemoteCandidates()
+	require.Len(t, got, 2)
+	assert.Equal(t, nat.CandidateSrflx, got[1].Type)
+
+	// 修改副本与原切片都不应影响内部存储。
+	got[0].Priority = 999
+	rem[1].Priority = 888
+	again := p.RemoteCandidates()
+	assert.Equal(t, uint32(100), again[0].Priority)
+	assert.Equal(t, uint32(50), again[1].Priority)
+
+	// Local 独立于 Remote。
+	loc := []nat.Candidate{{Type: nat.CandidateHost, Addr: netip.MustParseAddrPort("10.0.0.1:11010")}}
+	p.SetLocalCandidates(loc)
+	assert.Len(t, p.LocalCandidates(), 1)
+	assert.Len(t, p.RemoteCandidates(), 2)
 }

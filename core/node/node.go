@@ -18,6 +18,7 @@ import (
 	"github.com/LiStudioorg/limesh/core/config"
 	"github.com/LiStudioorg/limesh/core/crypto"
 	"github.com/LiStudioorg/limesh/core/ingress"
+	"github.com/LiStudioorg/limesh/core/nat"
 	"github.com/LiStudioorg/limesh/core/packet"
 	"github.com/LiStudioorg/limesh/core/peer"
 	"github.com/LiStudioorg/limesh/core/route"
@@ -83,6 +84,20 @@ type Node struct {
 	version string
 	// reload 触发配置热重载(注入给 Admin API);可为 nil。
 	reload func() error
+
+	// ---- NAT 穿透(Phase 2a) ----
+
+	// natDetector 探测 NAT 类型;为 nil 表示未启用。
+	natDetector *nat.Detector
+	// natCollector 收集候选地址;为 nil 表示未启用。
+	natCollector *nat.Collector
+
+	// natMu 保护下面的 NAT 观测结果。
+	natMu       sync.RWMutex
+	natType     nat.NATType
+	natMapped   *nat.MappedAddr
+	natDetected time.Time
+	natCands    []nat.Candidate
 }
 
 // Options 是构造 Node 的参数。
@@ -116,6 +131,10 @@ type Options struct {
 	NoIngress bool
 	// NoAdmin 为真时即使配置启用也跳过 Admin API(测试用途)。
 	NoAdmin bool
+	// NoNAT 为真时跳过 NAT 探测与候选收集(测试用途)。
+	NoNAT bool
+	// NATDetector 允许注入 NAT 探测器(测试用途);为空时按配置构造。
+	NATDetector *nat.Detector
 	// Version 是二进制版本,用于 Admin API 的 /version 端点。
 	Version string
 	// Reload 触发配置热重载;为空时 Admin API 的 reload 端点返回 501。
@@ -188,6 +207,17 @@ func New(opts Options) (*Node, error) {
 			return nil, fmt.Errorf("node: new: prober: %w", err)
 		}
 		node.dp.prober = prober
+
+		// NAT 穿透(Phase 2a):探测 NAT 类型并收集候选地址。未配置 STUN 或
+		// 显式禁用时不启用,节点仍可正常组网(只是缺少 srflx 候选与 NAT 类型)。
+		if !opts.NoNAT {
+			if err := node.setupNAT(opts); err != nil {
+				return nil, fmt.Errorf("node: new: nat: %w", err)
+			}
+		}
+
+		// 握手时携带本端候选地址。
+		node.dp.candidateProvider = node.CandidateList
 
 		// 明文投递:装配了 Ingress 时交给 Ingress 写回 TUN;否则用注入的回调。
 		switch {
@@ -297,6 +327,9 @@ func (n *Node) Run(ctx context.Context) error {
 	// 启动 Admin API(若配置启用且未被测试禁用)。
 	adminDone := n.startAdminAPI(ctx)
 
+	// 启动 NAT 探测与候选收集循环(若已装配)。
+	natDone := n.startNATLoop(ctx)
+
 	ingressMode := ""
 	if n.ingress != nil {
 		ingressMode = string(n.ingress.Mode())
@@ -323,12 +356,15 @@ func (n *Node) Run(ctx context.Context) error {
 		zap.String("reason", context.Cause(ctx).Error()),
 	)
 
-	// 关闭顺序:Admin API → 转发循环 → 数据面 → 监听器。
+	// 关闭顺序:Admin API → NAT → 转发循环 → 数据面 → 监听器。
 	if n.adminSrv != nil {
 		_ = n.adminSrv.Close()
 	}
 	if adminDone != nil {
 		<-adminDone
+	}
+	if natDone != nil {
+		<-natDone
 	}
 	if fwdDone != nil {
 		<-fwdDone
@@ -375,6 +411,19 @@ func (n *Node) startAdminAPI(ctx context.Context) <-chan struct{} {
 		if err := srv.Serve(ctx); err != nil {
 			n.log.Warn("admin api serve error", zap.Error(err))
 		}
+	}()
+	return done
+}
+
+// startNATLoop 启动 NAT 探测循环,返回其结束信号;未装配时返回 nil。
+func (n *Node) startNATLoop(ctx context.Context) <-chan struct{} {
+	if n.natCollector == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.runNATLoop(ctx)
 	}()
 	return done
 }
@@ -653,6 +702,11 @@ func (n *Node) Close() error {
 	// 这里做幂等兜底。
 	if dp != nil {
 		dp.shutdown()
+	}
+
+	// 释放 NAT 探测器的 STUN socket。
+	if n.natDetector != nil {
+		_ = n.natDetector.Close()
 	}
 
 	n.closeListeners(listeners)

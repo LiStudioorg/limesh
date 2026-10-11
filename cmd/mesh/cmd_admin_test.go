@@ -61,6 +61,18 @@ func (m *cliMockNode) TopologySnapshot() api.TopologySnapshot {
 
 func (m *cliMockNode) Config() *config.Config { return m.cfg }
 
+func (m *cliMockNode) NAT() api.NATSnapshot {
+	return api.NATSnapshot{Type: "cone", Mapped: "203.0.113.5:45231", CandidateCount: 2}
+}
+
+func (m *cliMockNode) Candidates() []api.CandidateSnapshot {
+	return []api.CandidateSnapshot{
+		{Type: "host", Addr: "192.168.1.10:11010", Priority: 2130706431, Source: "eth0"},
+		{Type: "host", Addr: "[2001:db8::1]:11010", Priority: 2130706687, Source: "eth0"},
+		{Type: "srflx", Addr: "203.0.113.5:45231", Priority: 16777215, Source: "stun:stun.l.google.com:19302"},
+	}
+}
+
 // startMockAPI 启动一个基于 Unix Socket 的 mock Admin API,返回 socket 路径。
 func startMockAPI(t *testing.T) string {
 	t.Helper()
@@ -279,4 +291,36 @@ func TestRootHelpListsCommands(t *testing.T) {
 	for _, sub := range []string{"status", "peer", "route", "topo", "config", "node", "version"} {
 		assert.Contains(t, out, sub, "根帮助应列出 %s", sub)
 	}
+}
+
+func TestNATCommand(t *testing.T) {
+	sock := startMockAPI(t)
+	out, err := execute(t, "nat", "--socket", sock)
+	require.NoError(t, err)
+	assert.Contains(t, out, "cone")
+	assert.Contains(t, out, "203.0.113.5:45231")
+	assert.Contains(t, out, "Candidates:")
+}
+
+func TestNATCommandJSON(t *testing.T) {
+	sock := startMockAPI(t)
+	out, err := execute(t, "nat", "--socket", sock, "--json")
+	require.NoError(t, err)
+	assert.Contains(t, out, "\"type\": \"cone\"")
+}
+
+func TestNATCandidatesCommand(t *testing.T) {
+	sock := startMockAPI(t)
+	out, err := execute(t, "nat", "candidates", "--socket", sock)
+	require.NoError(t, err)
+	assert.Contains(t, out, "TYPE")
+	assert.Contains(t, out, "192.168.1.10:11010")
+	assert.Contains(t, out, "srflx")
+}
+
+func TestNATProbeCommand(t *testing.T) {
+	sock := startMockAPI(t)
+	out, err := execute(t, "nat", "probe", "--socket", sock)
+	require.NoError(t, err)
+	assert.Contains(t, out, "NAT Type")
 }

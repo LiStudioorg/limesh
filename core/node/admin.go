@@ -128,5 +128,33 @@ func (n *Node) TopologySnapshot() api.TopologySnapshot {
 	return snap
 }
 
+// NAT 实现 api.NodeInfo。
+func (n *Node) NAT() api.NATSnapshot {
+	snap := api.NATSnapshot{
+		Type: string(n.NATType()),
+	}
+	if m := n.MappedAddr(); m != nil {
+		snap.Mapped = m.String()
+	}
+	snap.DetectedAt = n.NATDetectedAt()
+	snap.CandidateCount = len(n.Candidates())
+	return snap
+}
+
+// Candidates 实现 api.NodeInfo。
+func (n *Node) Candidates() []api.CandidateSnapshot {
+	cands := n.CandidateList()
+	out := make([]api.CandidateSnapshot, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, api.CandidateSnapshot{
+			Type:     string(c.Type),
+			Addr:     c.Addr.String(),
+			Priority: c.Priority,
+			Source:   c.Source,
+		})
+	}
+	return out
+}
+
 // 确保 Node 满足 api.NodeInfo(编译期断言)。
 var _ api.NodeInfo = (*Node)(nil)

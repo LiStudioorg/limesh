@@ -700,6 +700,32 @@ network.mtu       ← MESH_NETWORK_MTU
 log.level         ← 默认值
 ```
 
+#### `mesh nat` — NAT 探测
+
+```bash
+mesh nat                 # NAT 类型与公网映射
+mesh nat candidates      # 候选地址列表
+mesh nat probe           # 读取最近一次探测结果
+mesh nat --json
+```
+
+```
+NAT Type:     cone (锥形)
+Mapped Addr:  203.0.113.77:45231
+Detected:     2026-10-11 09:54:56
+Candidates:   3
+```
+
+```bash
+mesh nat candidates
+```
+
+```
+TYPE   ADDRESS                          PRIORITY    SOURCE
+host   192.168.1.10:11010              2113942271  eth0
+srflx  203.0.113.77:45231              1700000000  stun:stun.l.google.com:19302
+```
+
 #### `mesh version` — 版本
 
 ```bash

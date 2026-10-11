@@ -304,6 +304,8 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/config/reload", s.auth(s.handleConfigReload))
 	mux.HandleFunc("/api/v1/config/validate", s.auth(s.handleConfigValidate))
 	mux.HandleFunc("/api/v1/version", s.auth(s.handleVersion))
+	mux.HandleFunc("/api/v1/nat", s.auth(s.handleNAT))
+	mux.HandleFunc("/api/v1/candidates", s.auth(s.handleCandidates))
 
 	return mux
 }
@@ -545,6 +547,26 @@ func (s *Server) handleConfigValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"valid": true})
+}
+
+func (s *Server) handleNAT(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, s.node.NAT())
+}
+
+func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	cands := s.node.Candidates()
+	if cands == nil {
+		cands = []CandidateSnapshot{}
+	}
+	writeJSON(w, cands)
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {

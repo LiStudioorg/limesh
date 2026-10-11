@@ -39,6 +39,8 @@ func tunPingConfig(t *testing.T, name, hostname, tunName string) *config.Config 
 	cfg.Peers = []string{}
 	cfg.Ingress.Mode = "tun"
 	cfg.Ingress.Interface = tunName
+	// 测试不访问真实 STUN
+	cfg.NAT.STUNServers = nil
 	require.NoError(t, cfg.Validate())
 	return cfg
 }

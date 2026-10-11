@@ -34,6 +34,15 @@ func (m *mockNode) PeerList() []PeerSnapshot           { return m.peers }
 func (m *mockNode) RouteList() []RouteSnapshot         { return m.routes }
 func (m *mockNode) TopologySnapshot() TopologySnapshot { return m.topology }
 func (m *mockNode) Config() *config.Config             { return m.cfg }
+func (m *mockNode) NAT() NATSnapshot {
+	return NATSnapshot{Type: "cone", Mapped: "203.0.113.5:45231", CandidateCount: 2}
+}
+func (m *mockNode) Candidates() []CandidateSnapshot {
+	return []CandidateSnapshot{
+		{Type: "host", Addr: "192.168.1.10:11010", Priority: 2130706431, Source: "eth0"},
+		{Type: "srflx", Addr: "203.0.113.5:45231", Priority: 16777215, Source: "stun:stun.l.google.com:19302"},
+	}
+}
 
 // newMockNode 构造一个带样本数据的 mock。
 func newMockNode() *mockNode {
@@ -454,4 +463,28 @@ func TestPeerByIDEmpty(t *testing.T) {
 	srv, _ := startTestServer(t, ServerOptions{})
 	res := doRequest(t, srv, http.MethodGet, "/api/v1/peers/", "")
 	assert.Equal(t, http.StatusBadRequest, res.Code)
+}
+
+// TestServerNATAndCandidates 验证 /nat 与 /candidates 端点。
+func TestServerNATAndCandidates(t *testing.T) {
+	_, cl := startTestServer(t, ServerOptions{})
+
+	info, err := cl.NAT(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "cone", info.Type)
+	assert.Equal(t, "203.0.113.5:45231", info.Mapped)
+	assert.Equal(t, 2, info.CandidateCount)
+
+	cands, err := cl.Candidates(context.Background())
+	require.NoError(t, err)
+	require.Len(t, cands, 2)
+	assert.Equal(t, "host", cands[0].Type)
+	assert.NotZero(t, cands[0].Priority)
+}
+
+// TestServerCandidatesMethodNotAllowed 验证非 GET 被拒绝。
+func TestServerCandidatesMethodNotAllowed(t *testing.T) {
+	srv, _ := startTestServer(t, ServerOptions{})
+	assert.Equal(t, http.StatusMethodNotAllowed, doRequest(t, srv, http.MethodPost, "/api/v1/nat", "").Code)
+	assert.Equal(t, http.StatusMethodNotAllowed, doRequest(t, srv, http.MethodPost, "/api/v1/candidates", "").Code)
 }

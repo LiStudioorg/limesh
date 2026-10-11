@@ -172,6 +172,8 @@ type Config struct {
 	Routing RoutingConfig `koanf:"routing"`
 	// Admin 是 Admin API 配置。
 	Admin AdminConfig `koanf:"admin"`
+	// NAT 是 NAT 穿透与候选地址收集配置。
+	NAT NATConfig `koanf:"nat"`
 	// Path 记录配置来源文件,供排错与来源追踪使用,不参与序列化。
 	Path string `koanf:"-"`
 }
@@ -302,6 +304,47 @@ const (
 	DefaultAdminTokenFile = "/var/lib/mesh/admin.token"
 )
 
+// NATConfig 描述 NAT 穿透与候选地址收集配置(docs/CONFIG.md 6.6)。
+//
+// Phase 2a 只实现 STUN 客户端与 NAT 类型探测;打洞策略开关
+// (ice/upnp/punch_timeout 等)属 Phase 2b/2d,此处先不引入。
+type NATConfig struct {
+	// STUNServers 是 STUN 服务器列表,格式 host:port 或 stun:host:port。
+	STUNServers []string `koanf:"stun_servers"`
+	// STUNTimeout 是单次 STUN 查询的超时。
+	STUNTimeout time.Duration `koanf:"stun_timeout"`
+	// DetectCacheTTL 是 NAT 类型探测结果的缓存时长。
+	DetectCacheTTL time.Duration `koanf:"detect_cache_ttl"`
+	// CandidateSkipInterfaces 是要跳过的网卡名前缀(候选地址收集)。
+	CandidateSkipInterfaces []string `koanf:"candidate_skip_interfaces"`
+}
+
+// NAT 相关默认值。
+const (
+	// DefaultSTUNTimeout 是默认 STUN 查询超时。
+	DefaultSTUNTimeout = 3 * time.Second
+	// DefaultNATDetectCacheTTL 是默认 NAT 探测缓存时长。
+	DefaultNATDetectCacheTTL = 5 * time.Minute
+)
+
+// DefaultSTUNServers 是内置的公共 STUN 服务器列表。
+//
+// 选用多个不同运营商的服务器,避免单点不可用;NAT 类型探测至少需要 2 个
+// 可达服务器才能区分锥形与对称。
+var DefaultSTUNServers = []string{
+	"stun:stun.l.google.com:19302",
+	"stun:stun.cloudflare.com:3478",
+	"stun:stun1.l.google.com:19302",
+}
+
+// DefaultCandidateSkipInterfaces 是默认跳过的网卡名前缀。
+//
+// 这些前缀覆盖容器虚拟网卡(docker/veth/br-)、隧道设备(tun/utun/wg)等,
+// 它们的地址对打洞通常无用,且会污染候选列表。
+var DefaultCandidateSkipInterfaces = []string{
+	"docker", "veth", "br-", "tun", "utun", "wg", "lo",
+}
+
 // Default 返回内置默认值构成的配置。
 //
 // 默认值是优先级链的最低层;任何来源都可以覆盖它。
@@ -353,6 +396,12 @@ func Default() *Config {
 			Enabled:   false,
 			Listen:    "", // 留空 -> 平台默认
 			TokenFile: DefaultAdminTokenFile,
+		},
+		NAT: NATConfig{
+			STUNServers:             append([]string(nil), DefaultSTUNServers...),
+			STUNTimeout:             DefaultSTUNTimeout,
+			DetectCacheTTL:          DefaultNATDetectCacheTTL,
+			CandidateSkipInterfaces: append([]string(nil), DefaultCandidateSkipInterfaces...),
 		},
 	}
 }
@@ -433,6 +482,48 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: validate: admin: %w", err)
 	}
 
+	if err := c.NAT.validate(); err != nil {
+		return fmt.Errorf("config: validate: nat: %w", err)
+	}
+
+	return nil
+}
+
+// validate 校验 [nat] 段。
+func (n NATConfig) validate() error {
+	if n.STUNTimeout <= 0 {
+		return fmt.Errorf("stun_timeout must be positive, got %v", n.STUNTimeout)
+	}
+	if n.DetectCacheTTL < 0 {
+		return fmt.Errorf("detect_cache_ttl must not be negative, got %v", n.DetectCacheTTL)
+	}
+	for i, s := range n.STUNServers {
+		if err := validateSTUNServer(s); err != nil {
+			return fmt.Errorf("stun_servers[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// validateSTUNServer 校验单个 STUN 服务器地址。
+//
+// 接受 "host:port" 与 "stun:host:port" 两种写法(与 docs/CONFIG.md 一致)。
+func validateSTUNServer(s string) error {
+	if s == "" {
+		return fmt.Errorf("empty STUN server")
+	}
+	host := strings.TrimPrefix(s, "stun:")
+	host, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		return fmt.Errorf("%q: want host:port: %w", s, err)
+	}
+	if host == "" {
+		return fmt.Errorf("%q: host must not be empty", s)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%q: invalid port %q", s, portStr)
+	}
 	return nil
 }
 
@@ -636,5 +727,8 @@ func (c *Config) Snapshot() *Config {
 		rc.Ports = append([]int(nil), r.Ports...)
 		cp.Security.ACL.Rules[i] = rc
 	}
+
+	cp.NAT.STUNServers = append([]string(nil), c.NAT.STUNServers...)
+	cp.NAT.CandidateSkipInterfaces = append([]string(nil), c.NAT.CandidateSkipInterfaces...)
 	return &cp
 }

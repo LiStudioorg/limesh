@@ -53,6 +53,7 @@ func newIngressNodeWithRouting(t *testing.T, name string, kp *crypto.KeyPair, pe
 		KeyPair: kp,
 		Peers:   peers,
 		Ingress: ing,
+		NoNAT:   true,
 	})
 	require.NoError(t, err)
 	return &ingressNode{node: n, dev: dev}

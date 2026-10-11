@@ -190,6 +190,24 @@ func (c *Client) ConfigSources(ctx context.Context) ([]ConfigSource, error) {
 	return out, nil
 }
 
+// NAT 获取 NAT 穿透观测。
+func (c *Client) NAT(ctx context.Context) (*NATSnapshot, error) {
+	var out NATSnapshot
+	if err := c.get(ctx, "/api/v1/nat", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Candidates 获取候选地址列表。
+func (c *Client) Candidates(ctx context.Context) ([]CandidateSnapshot, error) {
+	var out []CandidateSnapshot
+	if err := c.get(ctx, "/api/v1/candidates", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Version 获取节点版本。
 func (c *Client) Version(ctx context.Context) (string, error) {
 	var out map[string]string

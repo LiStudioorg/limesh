@@ -689,6 +689,28 @@ ewma_new = α × sample + (1 - α) × ewma_old
 A 经 B 中转到 C;B 掉线后 A、C 重新收敛为不可达。打洞、真实中继、多路径
 属 Phase 2/5。
 
+#### 8.9.5 Phase 2a 实现现状(NAT 探测)
+
+截至 Phase 2a,`core/nat` 已实现 NAT 穿透的**观测层**:
+
+| 能力 | Phase 2a 状态 | 说明 |
+|---|---|---|
+| STUN 客户端 | ✅ 已实现 | 复用单一 UDP socket + 单一读循环分派(见下) |
+| NAT 类型探测 | ⚠️ 简化 | 三级:`open` / `cone` / `symmetric`。锥形细分(full/restricted/port-restricted)属 Phase 2d |
+| 候选地址收集 | ✅ 已实现 | host(网卡) + srflx(STUN);relay 属 Phase 2c |
+| 候选交换 | ⚠️ 握手携带 | 候选地址作为 Noise 握手载荷传输(临时机制);Phase 2c 控制面完成后改为控制面下发 |
+| 打洞 | ❌ 未实现 | `Probing` / `Relayed` 仍为状态占位(Phase 2b) |
+| UPnP/PMP/PCP | ❌ 未实现 | Phase 2d |
+
+**STUN 客户端的关键设计**:NAT 类型探测要求"同一本地端口经不同服务器
+观察到的映射是否一致",因此所有查询必须复用同一个 UDP socket。但共享
+socket 上并发查询会互相抢走响应,故 `core/nat` 采用**单一读循环 + 按事务 ID
+分派**的模型,而非让每个查询各自读 socket。
+
+**验收边界**:节点能通过 STUN 得到公网映射、判定 open/cone/symmetric、
+枚举 host/srflx 候选地址,并通过 Admin API(`/api/v1/nat`、`/api/v1/candidates`)
+与 `mesh nat` 命令暴露。打洞与中继属 Phase 2b/2c。
+
 ### 8.10 安全考虑
 
 | 威胁 | 对策 |

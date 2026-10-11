@@ -273,6 +273,17 @@ func (h *Handshake) checkDeadline() error {
 // 发起方首次调用产出 Init,收到 Resp 后再次调用产出 Complete;
 // 响应方收到 Init 后调用产出 Resp。
 func (h *Handshake) WriteMessage() ([]byte, error) {
+	return h.WriteMessageWithPayload(nil)
+}
+
+// WriteMessageWithPayload 与 WriteMessage 相同,但在 Noise 消息中附带一段
+// 应用层数据。
+//
+// 用途:Phase 2a 借握手携带本端候选地址(见 docs/CONFIG.md 6.6),避免为
+// 候选交换单独引入一轮往返。payload 会作为 Noise 消息体的一部分被加密传输,
+// 对端通过 ReadMessage 的返回值取得。payload 上限由 Noise 消息长度约束,
+// 调用方应控制在数百字节内。
+func (h *Handshake) WriteMessageWithPayload(appPayload []byte) ([]byte, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -292,7 +303,7 @@ func (h *Handshake) WriteMessage() ([]byte, error) {
 	switch {
 	case h.initiator && h.stage == StageInit:
 		// 第一条消息:Noise IK 的 message 1。
-		payload, _, _, err := h.noiseState.WriteMessage(nil, nil)
+		payload, _, _, err := h.noiseState.WriteMessage(nil, appPayload)
 		if err != nil {
 			h.lastError = err
 			return nil, fmt.Errorf("handshake: write init: %w: %w", ErrNoise, err)
@@ -317,7 +328,7 @@ func (h *Handshake) WriteMessage() ([]byte, error) {
 	case !h.initiator && h.stage == StageSentInit:
 		// 已处理过 Init,产出 Resp。
 		// 这是 IK 的最后一条 Noise 消息,本次调用会返回派生完成的密钥。
-		payload, send, recv, err := h.noiseState.WriteMessage(nil, nil)
+		payload, send, recv, err := h.noiseState.WriteMessage(nil, appPayload)
 		if err != nil {
 			h.lastError = err
 			return nil, fmt.Errorf("handshake: write resp: %w: %w", ErrNoise, err)

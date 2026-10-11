@@ -13,9 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LiStudioorg/limesh/core/crypto"
+	"github.com/LiStudioorg/limesh/core/nat"
 	"github.com/LiStudioorg/limesh/core/session"
 )
 
@@ -181,6 +183,11 @@ type Peer struct {
 	// history 记录全部状态转换,仅在开启审计时保留。
 	history []Transition
 	closed  bool
+
+	// remoteCandidates 是对端交换来的候选地址(可能来自握手或后续更新)。
+	remoteCandidates atomic.Pointer[[]nat.Candidate]
+	// localCandidates 是本端为该对端准备的候选地址。
+	localCandidates atomic.Pointer[[]nat.Candidate]
 }
 
 // New 按参数构造一个 Peer。
@@ -252,6 +259,38 @@ func (p *Peer) Driver() Driver {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.driver
+}
+
+// SetRemoteCandidates 保存对端交换来的候选地址。
+//
+// 存储的是副本,调用方可安全复用传入切片。Phase 2a 仅存储;打洞(2b)会消费它。
+func (p *Peer) SetRemoteCandidates(cands []nat.Candidate) {
+	cp := append([]nat.Candidate(nil), cands...)
+	p.remoteCandidates.Store(&cp)
+}
+
+// RemoteCandidates 返回对端候选地址的副本。
+func (p *Peer) RemoteCandidates() []nat.Candidate {
+	ptr := p.remoteCandidates.Load()
+	if ptr == nil {
+		return nil
+	}
+	return append([]nat.Candidate(nil), (*ptr)...)
+}
+
+// SetLocalCandidates 保存本端为该对端准备的候选地址。
+func (p *Peer) SetLocalCandidates(cands []nat.Candidate) {
+	cp := append([]nat.Candidate(nil), cands...)
+	p.localCandidates.Store(&cp)
+}
+
+// LocalCandidates 返回本端候选地址的副本。
+func (p *Peer) LocalCandidates() []nat.Candidate {
+	ptr := p.localCandidates.Load()
+	if ptr == nil {
+		return nil
+	}
+	return append([]nat.Candidate(nil), (*ptr)...)
 }
 
 // LastSeen 返回最近一次收到对端包的时间。
