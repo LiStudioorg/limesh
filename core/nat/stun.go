@@ -175,12 +175,15 @@ func (c *STUNClient) unregister(id [stun.TransactionIDSize]byte) {
 
 // LocalPort 返回复用 socket 的本地端口;未创建时返回 0。
 //
-// 该端口用于 NAT 类型探测的"本地映射"比较。
+// 该端口用于 NAT 类型探测的"本地映射"比较。读取受锁保护,可与 Close 并发。
 func (c *STUNClient) LocalPort() uint16 {
-	if c.conn == nil {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
 		return 0
 	}
-	if ua, ok := c.conn.LocalAddr().(*net.UDPAddr); ok {
+	if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok {
 		return uint16(ua.Port)
 	}
 	return 0
@@ -191,10 +194,14 @@ func (c *STUNClient) LocalPort() uint16 {
 // 通过与一个 STUN 服务器建立"已连接"的 UDP 视图来取得内核选定的源地址,
 // 不发送任何数据。用于判断映射地址是否等于本机地址(即无 NAT)。
 func (c *STUNClient) LocalIP() string {
-	if c.conn == nil || len(c.servers) == 0 {
+	c.mu.Lock()
+	conn := c.conn
+	servers := c.servers
+	c.mu.Unlock()
+	if conn == nil || len(servers) == 0 {
 		return ""
 	}
-	raddr, err := resolveServer(c.servers[0])
+	raddr, err := resolveServer(servers[0])
 	if err != nil {
 		return ""
 	}
